@@ -23,6 +23,15 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
             ? date == once
             : slot.DayOfWeek == date.DayOfWeek && (slot.Parity == WeekParity.Every || slot.Parity == WeekParityOf(date)));
 
+    public async Task<LessonOccurrence?> OccurrenceAsync(int slotId, DateOnly date)
+    {
+        var slot = await db.ScheduleSlots.AsNoTracking().Include(x => x.Group).SingleOrDefaultAsync(x => x.Id == slotId);
+        if (slot is null || !Applies(slot, date)) return null;
+        var cancelled = await db.SlotCancellations.AnyAsync(x => x.SlotId == slotId && x.Date == date);
+        return new LessonOccurrence(slot, date, date.ToDateTime(slot.Start), date.ToDateTime(slot.End),
+            cancelled, slot.Group.Name);
+    }
+
     public async Task<List<LessonOccurrence>> ForDayAsync(int teacherId, DateOnly date)
     {
         var slots = await db.ScheduleSlots.AsNoTracking().Include(x => x.Group).Where(x => x.TeacherId == teacherId && x.ValidFrom <= date && (x.ValidTo == null || x.ValidTo >= date)).ToListAsync();

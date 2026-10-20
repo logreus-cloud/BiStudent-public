@@ -164,6 +164,7 @@ public sealed class AttendanceService(AppDbContext db, IConfiguration configurat
         var finals = subject is null ? new List<FinalGrade>() : await db.FinalGrades.AsNoTracking()
             .Where(x => x.TeacherId == teacherId && x.GroupId == groupId && x.Subject == subject).ToListAsync();
         var markMap = marks.ToDictionary(x => (x.SlotId, x.Date, x.StudentId));
+        var markedLessons = marks.Select(x => (x.SlotId, x.Date)).ToHashSet();
         var lessonGradeMap = lessonGrades.ToDictionary(x => (x.SlotId, x.Date, x.StudentId));
         var assessmentGradeMap = assessmentGrades.ToDictionary(x => (x.AssessmentId, x.StudentId));
         var finalMap = finals.ToDictionary(x => x.StudentId, x => x.Score);
@@ -179,7 +180,8 @@ public sealed class AttendanceService(AppDbContext db, IConfiguration configurat
                 return new JournalCell(mark?.Status, mark?.ExcuseReason, mark?.Comment, mark?.HasDocument ?? false,
                     lessonGradeMap.TryGetValue((column.Id, column.Date, student.Id), out var lessonGrade) ? lessonGrade.Score : null);
             }).ToList();
-            var lessonCount = cells.Where((cell, index) => cell.InGroup && columns[index].Kind == JournalColumnKind.Lesson).Count();
+            var lessonCount = cells.Where((cell, index) => cell.InGroup && columns[index].Kind == JournalColumnKind.Lesson &&
+                markedLessons.Contains((columns[index].Id, columns[index].Date))).Count();
             var present = cells.Count(x => x.InGroup && x.Status == AttendanceStatus.Present);
             var absent = cells.Count(x => x.InGroup && x.Status == AttendanceStatus.Absent);
             var excused = cells.Count(x => x.InGroup && x.Status == AttendanceStatus.Excused);

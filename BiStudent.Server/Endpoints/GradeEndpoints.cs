@@ -10,9 +10,12 @@ public static class GradeEndpoints
     internal static void MapGrades(this RouteGroupBuilder api)
     {
         api.MapPut("/lessons/{slotId:int}/{date}/grade", async (
-            int slotId, DateOnly date, GradeRequest request, ClaimsPrincipal user, AppDbContext db, AttendanceService attendance) =>
+            int slotId, DateOnly date, GradeRequest request, ClaimsPrincipal user, AppDbContext db,
+            ScheduleService schedule, AttendanceService attendance) =>
         {
             await ApiEndpoints.EnsureSlotAsync(db, user, slotId);
+            await ApiEndpoints.EnsureLessonAsync(schedule, slotId, date,
+                skipFuture: request.Score is null, allowMissing: request.Score is null);
             await attendance.SetLessonGradeAsync(slotId, date, request.StudentId, request.Score);
             return Results.NoContent();
         });

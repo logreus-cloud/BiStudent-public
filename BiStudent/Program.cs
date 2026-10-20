@@ -142,13 +142,14 @@ internal static class Program
         using var api = new ApiClient(settings);
         var code = 0;
         var saved = new List<string>();
+        // Входим до создания окна: боковая панель (роль, статус облака) строится как в обычном запуске после входа.
+        try { Task.Run(async () => { await api.LoginAsync(login, password); await api.LoadMeAsync(); }).GetAwaiter().GetResult(); }
+        catch (Exception ex) { File.WriteAllText(report, ex.ToString()); return 1; }
         using var form = new MainForm(api) { AutoOpenFirstPage = false, StartPosition = FormStartPosition.Manual, Location = new Point(0, 0), Size = new Size(1440, 900) };
         form.Shown += async (_, _) =>
         {
             try
             {
-                await api.LoginAsync(login, password);
-                await api.LoadMeAsync();
                 foreach (var key in PageKeys.Where(key => key != "admin" || api.Teacher?.IsAdmin == true))
                 {
                     await form.ShowPageAsync(key);

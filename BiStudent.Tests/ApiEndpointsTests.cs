@@ -151,6 +151,44 @@ public sealed class ApiEndpointsTests : IDisposable
         Assert.True((await csv.Content.ReadAsByteArrayAsync()).Take(3).SequenceEqual(Encoding.UTF8.GetPreamble()));
     }
 
+    [Fact]
+    public async Task AttendanceRejectsMissingAndCancelledLesson()
+    {
+        await AuthenticateAsync();
+        var (_, student, slot, date) = await LessonAsync();
+        var path = $"/api/lessons/{slot.Id}/{date.AddDays(1):yyyy-MM-dd}/attendance";
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.PutAsJsonAsync(path, new MarkRequest(student.Id, AttendanceStatus.Present), JsonOptions)).StatusCode);
+
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PostAsJsonAsync($"/api/schedule/slots/{slot.Id}/cancel", new CancelLessonRequest(date, null), JsonOptions)).StatusCode);
+        path = $"/api/lessons/{slot.Id}/{date:yyyy-MM-dd}/attendance";
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.PutAsJsonAsync(path, new MarkRequest(student.Id, AttendanceStatus.Present), JsonOptions)).StatusCode);
+    }
+
+    [Fact]
+    public async Task FutureLessonRejectsFinishButAllowsExcuseAndClear()
+    {
+        await AuthenticateAsync();
+        var (group, student, _, date) = await LessonAsync();
+        var slot = await PostAsync<SlotDto>("/api/schedule/slots", new SaveSlotRequest(group.Id, null, "Геометрия", null, date.DayOfWeek,
+            new TimeOnly(4, 0), new TimeOnly(5, 0), WeekParity.Every, null));
+        var future = date.AddDays(14);
+        var futurePath = $"/api/lessons/{slot.Id}/{future:yyyy-MM-dd}";
+        Assert.Equal(HttpStatusCode.BadRequest, (await client.PostAsync($"{futurePath}/finish", null)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PutAsJsonAsync($"{futurePath}/attendance",
+                new MarkRequest(student.Id, AttendanceStatus.Excused), JsonOptions)).StatusCode);
+
+        var missing = future.AddDays(1);
+        var missingPath = $"/api/lessons/{slot.Id}/{missing:yyyy-MM-dd}";
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PutAsJsonAsync($"{missingPath}/attendance", new MarkRequest(student.Id, null), JsonOptions)).StatusCode);
+        Assert.Equal(HttpStatusCode.NoContent,
+            (await client.PutAsJsonAsync($"{missingPath}/grade", new GradeRequest(student.Id, null), JsonOptions)).StatusCode);
+    }
+
     private async Task<T> PostAsync<T>(string path, object value)
     {
         var response = await client.PostAsJsonAsync(path, value, JsonOptions);
