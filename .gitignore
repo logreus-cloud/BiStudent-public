@@ -16,3 +16,6 @@ BiStudent.Core/Models/face_recognition_sface_2021dec.onnx
 BiStudent.Core/Models/*.download
 TestResults/
 /out/
+
+# Firebase Emulator
+*-debug.log

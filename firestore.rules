@@ -21,6 +21,7 @@ service cloud.firestore {
       return signedIn()
         && exists(uidPath())
         && exists(teacherPath())
+        && teacherDoc().data.FirebaseUid == request.auth.uid
         && teacherDoc().data.IsActive == true
         && teacherDoc().data._deleted != true;
     }
@@ -82,7 +83,11 @@ service cloud.firestore {
       allow read: if signedIn();
       allow create: if signedIn()
         && request.resource.data.keys().hasOnly(['uid'])
-        && request.resource.data.uid == request.auth.uid;
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/TeacherUids/$(request.auth.uid)).data.teacher is string
+        && getAfter(/databases/$(database)/documents/Teachers/$(getAfter(/databases/$(database)/documents/TeacherUids/$(request.auth.uid)).data.teacher)).data.FirebaseUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/Teachers/$(getAfter(/databases/$(database)/documents/TeacherUids/$(request.auth.uid)).data.teacher)).data.IsAdmin == true
+        && getAfter(/databases/$(database)/documents/Teachers/$(getAfter(/databases/$(database)/documents/TeacherUids/$(request.auth.uid)).data.teacher)).data.IsActive == true;
       allow update, delete: if false;
     }
   }

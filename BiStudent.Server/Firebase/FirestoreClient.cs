@@ -8,7 +8,8 @@ namespace BiStudent.Server.Firebase;
 
 public sealed record FirestoreDocument(
     string Collection, string Id, IReadOnlyDictionary<string, JsonElement> Fields,
-    DateTimeOffset? UpdatedAt);
+    DateTimeOffset? UpdatedAt, JsonElement? RawUpdatedAt = null,
+    string Name = "");
 
 public sealed record FirestoreWrite(
     string Collection, string Id, Dictionary<string, object?>? Fields,
@@ -73,18 +74,16 @@ public sealed class FirestoreClient(HttpClient http, IOptions<FirebaseOptions> o
             };
         if (afterDocument is not null)
         {
-            if (afterDocument.UpdatedAt is null || afterDocument.Collection != collection)
+            if (afterDocument.RawUpdatedAt is null ||
+                afterDocument.Collection != collection ||
+                string.IsNullOrEmpty(afterDocument.Name))
                 throw new ArgumentException("Неверная позиция страницы.", nameof(afterDocument));
             query["startAt"] = new
             {
                 values = new object[]
                 {
-                    new { timestampValue = afterDocument.UpdatedAt.Value.ToString("O") },
-                    new
-                    {
-                        referenceValue = $"projects/{settings.ProjectId}/databases/(default)/documents/" +
-                            collection + "/" + afterDocument.Id
-                    }
+                    afterDocument.RawUpdatedAt.Value,
+                    new { referenceValue = afterDocument.Name }
                 },
                 before = false
             };
@@ -157,13 +156,18 @@ public sealed class FirestoreClient(HttpClient http, IOptions<FirebaseOptions> o
         if (element.TryGetProperty("fields", out var values))
             foreach (var field in values.EnumerateObject())
                 fields[field.Name] = field.Value.Clone();
+        JsonElement? rawUpdatedAt = fields.TryGetValue("_updatedAt", out var timestamp)
+            ? timestamp : null;
         DateTimeOffset? updated = null;
-        if (fields.TryGetValue("_updatedAt", out var timestamp) &&
-            timestamp.TryGetProperty("timestampValue", out var value))
-            updated = DateTimeOffset.Parse(value.GetString()!,
-                System.Globalization.CultureInfo.InvariantCulture);
+        if (timestamp.ValueKind == JsonValueKind.Object &&
+            timestamp.TryGetProperty("timestampValue", out var value) &&
+            value.ValueKind == JsonValueKind.String &&
+            DateTimeOffset.TryParse(value.GetString(),
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+            updated = parsed;
         return new FirestoreDocument(collection, name[(name.LastIndexOf('/') + 1)..],
-            fields, updated);
+            fields, updated, rawUpdatedAt, name);
     }
 
     private static HttpRequestMessage Request(HttpMethod method, string url, string token)

@@ -41,8 +41,10 @@ public sealed class SyncService(
         .GetMethod(nameof(FindDependentsCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     private readonly SemaphoreSlim gate = new(1, 1);
+    private readonly SemaphoreSlim generationGate = new(1, 1);
     private readonly FirebaseOptions settings = options.Value;
     private readonly IDataProtector images = protection.CreateProtector("BiStudent.FaceSamples");
+    private int generation;
     private SyncStatus status = new(options.Value.Enabled ? SyncState.NotSignedIn : SyncState.Disabled,
         null, 0, null);
 
@@ -51,18 +53,41 @@ public sealed class SyncService(
 
     public void Reset()
     {
-        using var scope = scopes.CreateScope();
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        db.SyncOutbox.Where(entry => entry.Error != null)
-            .ExecuteUpdate(setters => setters.SetProperty(entry => entry.Error, (string?)null));
-        status = new SyncStatus(settings.Enabled ? SyncState.NotSignedIn : SyncState.Disabled,
-            null, status.Pending, null);
+        generationGate.Wait();
+        try
+        {
+            Interlocked.Increment(ref generation);
+            using var scope = scopes.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.SyncOutbox.Where(entry => entry.Error != null)
+                .ExecuteUpdate(setters => setters.SetProperty(entry => entry.Error, (string?)null));
+            status = new SyncStatus(settings.Enabled ? SyncState.NotSignedIn : SyncState.Disabled,
+                null, db.SyncOutbox.Count(), null);
+        }
+        finally { generationGate.Release(); }
+    }
+
+    private bool Current(int expected) => Volatile.Read(ref generation) == expected;
+
+    private async Task<bool> SaveIfCurrentAsync(
+        AppDbContext db, int expected, Action changes, CancellationToken cancellationToken)
+    {
+        await generationGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!Current(expected)) return false;
+            changes();
+            await db.SaveChangesAsync(cancellationToken);
+            return true;
+        }
+        finally { generationGate.Release(); }
     }
 
     public async Task PullAsync(
         IReadOnlyCollection<string> tables, CancellationToken ct, FirebaseSession? session = null)
     {
         await gate.WaitAsync(ct);
+        var currentGeneration = Volatile.Read(ref generation);
         var facesChanged = false;
         try
         {
@@ -74,12 +99,13 @@ public sealed class SyncService(
                 .Where(table => tables.Contains(table.Name)).ToArray();
             if (selected.Length != tables.Distinct().Count())
                 throw new ArgumentException("Неизвестная таблица синхронизации.", nameof(tables));
-            await ReceiveAsync(db, selected, session.IdToken, () => facesChanged = true, ct);
+            await ReceiveAsync(db, selected, session.IdToken, () => facesChanged = true,
+                currentGeneration, ct);
         }
         finally
         {
-            if (facesChanged) FacesChanged?.Invoke();
             gate.Release();
+            if (facesChanged) NotifyFacesChanged();
         }
     }
 
@@ -127,13 +153,15 @@ public sealed class SyncService(
             () => Guid.NewGuid().ToString("N"), CancellationToken.None);
         var item = await PrepareWriteAsync(db, selected,
             [new SyncOutboxEntry { Table = table, LocalId = localId }], device,
-            CancellationToken.None);
+            Volatile.Read(ref generation), CancellationToken.None);
         return item?.Write ?? throw new InvalidOperationException("Не удалось подготовить документ.");
     }
 
     public async Task<SyncReport> RunAsync(CancellationToken cancellationToken = default)
     {
         await gate.WaitAsync(cancellationToken);
+        var currentGeneration = Volatile.Read(ref generation);
+        var facesChanged = false;
         try
         {
             using var scope = scopes.CreateScope();
@@ -141,7 +169,6 @@ public sealed class SyncService(
             var state = SyncState.Disabled;
             var sent = 0;
             var received = 0;
-            var facesChanged = false;
             string? error = null;
             int pending;
             try
@@ -159,13 +186,16 @@ public sealed class SyncService(
                         if (await db.AppSettings.FindAsync([initialKey], cancellationToken) is null)
                             await QueueInitialAsync(db, model, cancellationToken);
 
-                        sent = await SendAsync(db, model, session, device, cancellationToken);
-                        if (!await db.SyncOutbox.AnyAsync(cancellationToken) &&
+                        sent = await SendAsync(db, model, session, device,
+                            currentGeneration, cancellationToken);
+                        if (Current(currentGeneration) &&
+                            !await db.SyncOutbox.AnyAsync(cancellationToken) &&
                             await db.AppSettings.FindAsync([initialKey], cancellationToken) is null)
-                            await SetSettingAsync(db, initialKey, "true", cancellationToken);
+                            await SetSettingIfCurrentAsync(
+                                db, initialKey, "true", currentGeneration, cancellationToken);
 
                         received = await ReceiveAsync(db, model.Tables, session.IdToken,
-                            () => facesChanged = true, cancellationToken);
+                            () => facesChanged = true, currentGeneration, cancellationToken);
                         state = SyncState.Ok;
                     }
                 }
@@ -187,38 +217,49 @@ public sealed class SyncService(
             }
             finally
             {
-                pending = await db.SyncOutbox.CountAsync(CancellationToken.None);
-                var blocked = await db.SyncOutbox.CountAsync(
-                    entry => entry.Error != null, CancellationToken.None);
-                if (blocked > 0)
+                await generationGate.WaitAsync(CancellationToken.None);
+                try
                 {
-                    var reason = await db.SyncOutbox
-                        .Where(entry => entry.Error != null)
-                        .OrderBy(entry => entry.Id)
-                        .Select(entry => entry.Error)
-                        .FirstAsync(CancellationToken.None);
-                    error = $"{blocked} изменений не удаётся отправить: {reason}" +
-                        (error is null ? "" : $"; {error}");
+                    pending = await db.SyncOutbox.CountAsync(CancellationToken.None);
+                    var blocked = await db.SyncOutbox.CountAsync(
+                        entry => entry.Error != null, CancellationToken.None);
+                    if (blocked > 0)
+                    {
+                        var reason = await db.SyncOutbox
+                            .Where(entry => entry.Error != null)
+                            .OrderBy(entry => entry.Id)
+                            .Select(entry => entry.Error)
+                            .FirstOrDefaultAsync(CancellationToken.None);
+                        error = $"{blocked} изменений не удаётся отправить: {reason}" +
+                            (error is null ? "" : $"; {error}");
+                    }
+                    if (Current(currentGeneration))
+                        status = new SyncStatus(state,
+                            state == SyncState.Ok ? clock.GetUtcNow() : status.LastSuccessAt,
+                            pending, error);
                 }
-                status = new SyncStatus(state,
-                    state == SyncState.Ok ? clock.GetUtcNow() : status.LastSuccessAt,
-                    pending, error);
-                if (facesChanged) FacesChanged?.Invoke();
+                finally { generationGate.Release(); }
             }
-            return Report(state, sent, received, facesChanged, pending, error);
+            return new SyncReport(state, sent, received, facesChanged, pending, error);
         }
         finally
         {
             gate.Release();
+            if (facesChanged) NotifyFacesChanged();
         }
     }
 
-    private SyncReport Report(
-        SyncState state, int sent, int received, bool facesChanged, int pending, string? error)
+    private void NotifyFacesChanged()
     {
-        status = new SyncStatus(state,
-            state == SyncState.Ok ? clock.GetUtcNow() : status.LastSuccessAt, pending, error);
-        return new SyncReport(state, sent, received, facesChanged, pending, error);
+        if (FacesChanged is not { } handlers) return;
+        foreach (Action handler in handlers.GetInvocationList())
+        {
+            try { handler(); }
+            catch (Exception exception)
+            {
+                logger.LogWarning(exception, "Ошибка обработчика FacesChanged");
+            }
+        }
     }
 
     private static async Task<string> GetOrCreateAsync(
@@ -232,14 +273,21 @@ public sealed class SyncService(
         return value;
     }
 
-    private static async Task SetSettingAsync(
-        AppDbContext db, string key, string value, CancellationToken cancellationToken)
+    private async Task SetSettingIfCurrentAsync(
+        AppDbContext db, string key, string value, int expected,
+        CancellationToken cancellationToken)
     {
-        var setting = await db.AppSettings.FindAsync([key], cancellationToken);
-        if (setting is null)
-            db.AppSettings.Add(new AppSetting { Key = key, Value = value });
-        else setting.Value = value;
-        await db.SaveChangesAsync(cancellationToken);
+        await generationGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!Current(expected)) return;
+            var setting = await db.AppSettings.FindAsync([key], cancellationToken);
+            if (setting is null)
+                db.AppSettings.Add(new AppSetting { Key = key, Value = value });
+            else setting.Value = value;
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        finally { generationGate.Release(); }
     }
 
     private static async Task QueueInitialAsync(
@@ -256,7 +304,7 @@ public sealed class SyncService(
 
     private async Task<int> SendAsync(
         AppDbContext db, SyncModel model, FirebaseSession session, string device,
-        CancellationToken cancellationToken)
+        int currentGeneration, CancellationToken cancellationToken)
     {
         var sent = 0;
         var teacherId = sessions.TeacherId;
@@ -269,6 +317,7 @@ public sealed class SyncService(
             var tables = deleted ? model.Tables.Reverse() : model.Tables;
             foreach (var table in tables)
             {
+                if (!Current(currentGeneration)) return sent;
                 var entries = await db.SyncOutbox
                     .Where(entry => entry.Table == table.Name && entry.Deleted == deleted &&
                         entry.Error == null)
@@ -281,13 +330,15 @@ public sealed class SyncService(
                 var refused = false;
                 foreach (var group in groups)
                 {
+                    if (!Current(currentGeneration)) return sent;
                     var item = await PrepareWriteAsync(db, table, group, device,
-                        cancellationToken, limitedUid);
+                        currentGeneration, cancellationToken, limitedUid);
                     if (item is null) continue;
                     var size = WriteSize(item.Write) + 1;
                     if (items.Count == 400 || bytes + size > 8_000_000)
                     {
-                        var result = await SendPortionAsync(db, session.IdToken, items, cancellationToken);
+                        var result = await SendPortionAsync(db, session.IdToken, items,
+                            currentGeneration, cancellationToken);
                         sent += result.Sent;
                         refused = result.Refused;
                         items.Clear();
@@ -299,7 +350,8 @@ public sealed class SyncService(
                 }
                 if (!refused && items.Count > 0)
                 {
-                    var result = await SendPortionAsync(db, session.IdToken, items, cancellationToken);
+                    var result = await SendPortionAsync(db, session.IdToken, items,
+                        currentGeneration, cancellationToken);
                     sent += result.Sent;
                 }
             }
@@ -329,16 +381,19 @@ public sealed class SyncService(
 
     private async Task<(int Sent, bool Refused)> SendPortionAsync(
         AppDbContext db, string token, List<UploadItem> items,
-        CancellationToken cancellationToken)
+        int currentGeneration, CancellationToken cancellationToken)
     {
         try
         {
             var results = await firestore.CommitAsync(token,
                 items.Select(item => item.Write).ToArray(), cancellationToken);
-            for (var i = 0; i < items.Count; i++)
-                ApplyWriteResult(db, items[i],
-                    i < results.Count ? results[i].UpdateTime : null);
-            await db.SaveChangesAsync(cancellationToken);
+            if (!await SaveIfCurrentAsync(db, currentGeneration, () =>
+                {
+                    for (var i = 0; i < items.Count; i++)
+                        ApplyWriteResult(db, items[i],
+                            i < results.Count ? results[i].UpdateTime : null);
+                }, cancellationToken))
+                return (0, true);
             return (items.Count, false);
         }
         catch (FirestorePermissionException)
@@ -346,25 +401,31 @@ public sealed class SyncService(
             var sent = 0;
             foreach (var item in items)
             {
+                if (!Current(currentGeneration)) return (sent, true);
                 try
                 {
                     var results = await firestore.CommitAsync(
                         token, [item.Write], cancellationToken);
-                    ApplyWriteResult(db, item,
-                        results.Count > 0 ? results[0].UpdateTime : null);
-                    await db.SaveChangesAsync(cancellationToken);
+                    if (!await SaveIfCurrentAsync(db, currentGeneration,
+                        () => ApplyWriteResult(db, item,
+                            results.Count > 0 ? results[0].UpdateTime : null),
+                        cancellationToken))
+                        return (sent, true);
                     sent++;
                 }
                 catch (FirestorePermissionException exception)
                 {
                     logger.LogWarning(exception, "Нет прав на документ {Table}/{Id}",
                         item.Write.Collection, item.Write.Id);
-                    if (item.Write.Collection == "Teachers")
-                        db.SyncOutbox.RemoveRange(item.Entries);
-                    else
-                        foreach (var entry in item.Entries)
-                            entry.Error = $"Нет прав на изменение {item.Write.Collection}/{item.Write.Id}.";
-                    await db.SaveChangesAsync(cancellationToken);
+                    if (!await SaveIfCurrentAsync(db, currentGeneration, () =>
+                        {
+                            if (item.Write.Collection == "Teachers")
+                                db.SyncOutbox.RemoveRange(item.Entries);
+                            else
+                                foreach (var entry in item.Entries)
+                                    entry.Error = $"Нет прав на изменение {item.Write.Collection}/{item.Write.Id}.";
+                        }, cancellationToken))
+                        return (sent, true);
                 }
             }
             return (sent, true);
@@ -373,7 +434,7 @@ public sealed class SyncService(
 
     private async Task<UploadItem?> PrepareWriteAsync(
         AppDbContext db, SyncTable table, List<SyncOutboxEntry> entries, string device,
-        CancellationToken cancellationToken, string? limitedUid = null)
+        int currentGeneration, CancellationToken cancellationToken, string? limitedUid = null)
     {
         var first = entries[0];
         if (first.Deleted)
@@ -455,8 +516,10 @@ public sealed class SyncService(
                 {
                     logger.LogWarning(exception, "Не удалось прочитать изображение {Table}/{Id}",
                         table.Name, first.LocalId);
-                    foreach (var entry in entries) entry.Error = "Не удалось расшифровать изображение.";
-                    await db.SaveChangesAsync(cancellationToken);
+                    await SaveIfCurrentAsync(db, currentGeneration, () =>
+                    {
+                        foreach (var entry in entries) entry.Error = "Не удалось расшифровать изображение.";
+                    }, cancellationToken);
                     return null;
                 }
             }
@@ -491,8 +554,9 @@ public sealed class SyncService(
                 }
                 if (!await db.SyncOutbox.AnyAsync(entry =>
                     entry.Table == parentTable && entry.LocalId == parentId &&
-                    !entry.Deleted, cancellationToken))
+                    !entry.Deleted && entry.Error == null, cancellationToken))
                 {
+                    await RemoveErroredAsync(db, parentTable, parentId, cancellationToken);
                     db.SyncOutbox.Add(new SyncOutboxEntry
                     {
                         Table = parentTable,
@@ -511,8 +575,10 @@ public sealed class SyncService(
         {
             logger.LogWarning("Документ {Table}/{Id} слишком большой для Firestore",
                 table.Name, first.LocalId);
-            foreach (var entry in entries) entry.Error = "Документ слишком большой для Firestore.";
-            await db.SaveChangesAsync(cancellationToken);
+            await SaveIfCurrentAsync(db, currentGeneration, () =>
+            {
+                foreach (var entry in entries) entry.Error = "Документ слишком большой для Firestore.";
+            }, cancellationToken);
             return null;
         }
 
@@ -523,6 +589,11 @@ public sealed class SyncService(
     private static void ApplyWriteResult(
         AppDbContext db, UploadItem item, DateTimeOffset? updated)
     {
+        var lastId = item.Entries.Max(entry => entry.Id);
+        db.SyncOutbox.RemoveRange(db.SyncOutbox.Where(entry =>
+            entry.Table == item.Write.Collection &&
+            entry.LocalId == item.Entries[0].LocalId &&
+            entry.Error != null && entry.Id < lastId).ToList());
         db.SyncOutbox.RemoveRange(item.Entries);
         if (item.Entries[0].Deleted)
         {
@@ -538,37 +609,50 @@ public sealed class SyncService(
                 if (existing is not null) db.SyncLinks.Remove(existing);
             }
         }
-        else if (item.Link is not null)
+        else if (item.Link is not null && item.Write.UpdateMask is null)
             item.Link.CloudUpdatedAt = updated;
     }
 
     private async Task<int> ReceiveAsync(
         AppDbContext db, IReadOnlyList<SyncTable> tables, string token,
-        Action facesChanged, CancellationToken cancellationToken)
+        Action facesChanged, int currentGeneration, CancellationToken cancellationToken)
     {
         var received = 0;
         foreach (var table in tables)
         {
+            if (!Current(currentGeneration)) return received;
             var cursorKey = "sync:cursor:" + table.Name;
             var setting = await db.AppSettings.FindAsync([cursorKey], cancellationToken);
             DateTimeOffset? cursor = setting is null ? null :
                 DateTimeOffset.Parse(setting.Value, CultureInfo.InvariantCulture);
-            var after = cursor?.AddMinutes(-2);
+            var after = cursor is null ? null :
+                SubtractOrNull(cursor.Value, TimeSpan.FromMinutes(2));
+            if (after is null) cursor = null;
             FirestoreDocument? position = null;
             DateTimeOffset? blockedAt = null;
+            var saveCursor = true;
             while (true)
             {
+                if (!Current(currentGeneration)) return received;
                 var page = await firestore.QueryChangedAsync(
                     token, table.Name, after, 300, cancellationToken, position);
                 if (page.Count == 0) break;
                 foreach (var document in page)
                 {
-                    if (document.UpdatedAt is null) continue;
-                    var result = await ApplyDocumentAsync(db, table, document, cancellationToken);
+                    if (!Current(currentGeneration)) return received;
+                    if (!ValidUpdatedAt(document))
+                    {
+                        logger.LogWarning("Неверный формат документа {Table}/{Id}",
+                            table.Name, document.Id);
+                        continue;
+                    }
+                    var result = await ApplyDocumentAsync(
+                        db, table, document, currentGeneration, cancellationToken);
                     if (result == ApplyResult.Deferred)
                     {
-                        blockedAt = document.UpdatedAt;
-                        break;
+                        if (blockedAt is null || document.UpdatedAt < blockedAt)
+                            blockedAt = document.UpdatedAt;
+                        continue;
                     }
                     if (result == ApplyResult.Applied)
                     {
@@ -580,26 +664,80 @@ public sealed class SyncService(
                     if (cursor is null || document.UpdatedAt > cursor)
                         cursor = document.UpdatedAt;
                 }
-                if (blockedAt is not null) break;
-                position = page[^1];
-                if (page.Count < 300 || position.UpdatedAt is null) break;
+                if (page.Count < 300) break;
+                position = page.LastOrDefault(document => document.RawUpdatedAt is not null);
+                if (position is null)
+                {
+                    logger.LogWarning(
+                        "Нет позиции следующей страницы для таблицы {Table}", table.Name);
+                    saveCursor = false;
+                    break;
+                }
             }
             if (blockedAt is not null && (cursor is null || cursor >= blockedAt))
-                cursor = blockedAt.Value.AddMilliseconds(-1);
-            if (cursor is not null)
-                await SetSettingAsync(db, cursorKey,
+                cursor = SubtractOrNull(blockedAt.Value, TimeSpan.FromMilliseconds(1));
+            if (cursor is null && setting is not null)
+                await SaveIfCurrentAsync(db, currentGeneration,
+                    () => db.AppSettings.Remove(setting), cancellationToken);
+            else if (saveCursor && cursor is not null)
+                await SetSettingIfCurrentAsync(db, cursorKey,
                     cursor.Value.ToString("O", CultureInfo.InvariantCulture),
-                    cancellationToken);
+                    currentGeneration, cancellationToken);
         }
         return received;
     }
 
+    private static DateTimeOffset? SubtractOrNull(DateTimeOffset value, TimeSpan amount)
+    {
+        try { return value.Subtract(amount); }
+        catch (ArgumentOutOfRangeException) { return null; }
+    }
+
+    private static bool ValidUpdatedAt(FirestoreDocument document) =>
+        document.Fields.TryGetValue("_updatedAt", out var field) &&
+        field.ValueKind == JsonValueKind.Object &&
+        field.TryGetProperty("timestampValue", out var value) &&
+        value.ValueKind == JsonValueKind.String &&
+        DateTimeOffset.TryParse(value.GetString(), CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind, out var updated) &&
+        document.UpdatedAt == updated;
+
     private async Task<ApplyResult> ApplyDocumentAsync(
+        AppDbContext db, SyncTable table, FirestoreDocument document,
+        int currentGeneration, CancellationToken cancellationToken)
+    {
+        await generationGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!Current(currentGeneration)) return ApplyResult.Deferred;
+            return await ApplyDocumentCoreAsync(db, table, document, cancellationToken);
+        }
+        finally { generationGate.Release(); }
+    }
+
+    private async Task<ApplyResult> ApplyDocumentCoreAsync(
         AppDbContext db, SyncTable table, FirestoreDocument document,
         CancellationToken cancellationToken)
     {
-        var deleted = document.Fields.TryGetValue("_deleted", out var flag) &&
-            flag.TryGetProperty("booleanValue", out var boolean) && boolean.GetBoolean();
+        bool deleted;
+        try
+        {
+            deleted = false;
+            if (document.Fields.TryGetValue("_deleted", out var flag))
+            {
+                if (flag.ValueKind != JsonValueKind.Object ||
+                    !flag.TryGetProperty("booleanValue", out var boolean) ||
+                    boolean.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    throw new FormatException("Неверное поле _deleted.");
+                deleted = boolean.GetBoolean();
+            }
+        }
+        catch (FormatException exception)
+        {
+            logger.LogWarning(exception, "Неверный формат документа {Table}/{Id}",
+                table.Name, document.Id);
+            return ApplyResult.Ignored;
+        }
         await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
         db.ApplyingRemote = true;
         try
@@ -703,6 +841,14 @@ public sealed class SyncService(
                         candidate.LocalId == (int)db.Entry(row).Property("Id").CurrentValue!,
                         cancellationToken);
                 var teacherAdopt = link is null && row is Teacher { FirebaseUid: null };
+                if (table.ClrType == typeof(Teacher) && old is not null &&
+                    !teacherAdopt)
+                {
+                    logger.LogWarning(
+                        "Преподаватель {Id} уже связан с другим документом Firebase",
+                        old.LocalId);
+                    return ApplyResult.Ignored;
+                }
                 if (row is not null)
                 {
                     var rowId = (int)db.Entry(row).Property("Id").CurrentValue!;
@@ -711,14 +857,6 @@ public sealed class SyncService(
                         .ToListAsync(cancellationToken);
                     if (queued.Count > 0 && !teacherAdopt) return ApplyResult.Deferred;
                     if (teacherAdopt) db.SyncOutbox.RemoveRange(queued);
-                }
-                if (table.ClrType == typeof(Teacher) && old is not null &&
-                    !teacherAdopt)
-                {
-                    logger.LogWarning(
-                        "Преподаватель {Id} уже связан с другим документом Firebase",
-                        old.LocalId);
-                    return ApplyResult.Ignored;
                 }
 
                 var applyValues = true;
@@ -760,13 +898,16 @@ public sealed class SyncService(
                         cancellationToken);
                     db.SyncLinks.Remove(old);
                     await db.SaveChangesAsync(cancellationToken);
-                    db.SyncOutbox.Add(new SyncOutboxEntry
+                    if (!teacherAdopt)
                     {
-                        Table = table.Name,
-                        LocalId = old.LocalId,
-                        CloudId = oldId,
-                        Deleted = true
-                    });
+                        db.SyncOutbox.Add(new SyncOutboxEntry
+                        {
+                            Table = table.Name,
+                            LocalId = old.LocalId,
+                            CloudId = oldId,
+                            Deleted = true
+                        });
+                    }
                 }
 
                 var inserted = row is null;
@@ -779,7 +920,8 @@ public sealed class SyncService(
                 if (applyValues && row is Teacher teacher && !inserted &&
                     (Changed(teacher.Login, values, nameof(Teacher.Login)) ||
                         Changed(teacher.IsAdmin, values, nameof(Teacher.IsAdmin)) ||
-                        Changed(teacher.IsActive, values, nameof(Teacher.IsActive))))
+                        Changed(teacher.IsActive, values, nameof(Teacher.IsActive)) ||
+                        Changed(teacher.FirebaseUid, values, nameof(Teacher.FirebaseUid))))
                     teacher.SecurityStamp = Guid.NewGuid().ToString("N");
                 if (applyValues)
                     foreach (var (name, value) in values)
@@ -863,12 +1005,24 @@ public sealed class SyncService(
         AppDbContext db, string table, int localId, CancellationToken cancellationToken)
     {
         if (db.SyncOutbox.Local.Any(entry =>
-                entry.Table == table && entry.LocalId == localId && !entry.Deleted) ||
+                entry.Table == table && entry.LocalId == localId &&
+                !entry.Deleted && entry.Error == null) ||
             await db.SyncOutbox.AnyAsync(entry =>
-                entry.Table == table && entry.LocalId == localId && !entry.Deleted,
+                entry.Table == table && entry.LocalId == localId &&
+                !entry.Deleted && entry.Error == null,
                 cancellationToken))
             return;
+        await RemoveErroredAsync(db, table, localId, cancellationToken);
         db.SyncOutbox.Add(new SyncOutboxEntry { Table = table, LocalId = localId });
+    }
+
+    private static async Task RemoveErroredAsync(
+        AppDbContext db, string table, int localId, CancellationToken cancellationToken)
+    {
+        var entries = await db.SyncOutbox.Where(entry =>
+            entry.Table == table && entry.LocalId == localId && entry.Error != null)
+            .ToListAsync(cancellationToken);
+        db.SyncOutbox.RemoveRange(entries);
     }
 
     private static async Task QueueDependentsAsync(

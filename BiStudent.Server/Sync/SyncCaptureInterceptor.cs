@@ -19,6 +19,7 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         public IDbContextTransaction? Transaction;
         public bool ManualOutbox;
         public List<Pending> Entries { get; } = [];
+        public HashSet<(string Table, int LocalId)> Replacements { get; } = [];
     }
 
     private readonly ConditionalWeakTable<DbContext, State> states = new();
@@ -97,8 +98,11 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         var state = new State();
         foreach (var entry in db.ChangeTracker.Entries())
         {
-            if (entry.Entity is SyncOutboxEntry && entry.State == EntityState.Added)
+            if (entry.Entity is SyncOutboxEntry manual && entry.State == EntityState.Added)
+            {
                 state.ManualOutbox = true;
+                state.Replacements.Add((manual.Table, manual.LocalId));
+            }
             if (!names.TryGetValue(entry.Metadata.ClrType, out var table)) continue;
             if (entry.State is not (EntityState.Added or EntityState.Modified or EntityState.Deleted))
                 continue;
@@ -126,7 +130,8 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         if (state is null) return;
         try
         {
-            if (state.Entries.Count > 0 && db.Database.CurrentTransaction is null)
+            if ((state.Entries.Count > 0 || state.ManualOutbox) &&
+                db.Database.CurrentTransaction is null)
                 state.Transaction = db.Database.BeginTransaction();
             ExpandCascades(db, state);
             for (var i = state.Entries.Count - 1; i >= 0; i--)
@@ -154,7 +159,8 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         if (state is null) return;
         try
         {
-            if (state.Entries.Count > 0 && db.Database.CurrentTransaction is null)
+            if ((state.Entries.Count > 0 || state.ManualOutbox) &&
+                db.Database.CurrentTransaction is null)
                 state.Transaction = await db.Database.BeginTransactionAsync(cancellationToken);
             await ExpandCascadesAsync(db, state, cancellationToken);
             for (var i = state.Entries.Count - 1; i >= 0; i--)
@@ -184,6 +190,12 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         {
             var queuedAt = DateTime.Now.ToString(
                 "yyyy-MM-dd HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture);
+            foreach (var entry in state.Entries)
+                state.Replacements.Add((entry.Table, entry.Entry is null ? entry.LocalId :
+                    (int)entry.Entry.Property("Id").CurrentValue!));
+            foreach (var (table, localId) in state.Replacements)
+                db.Database.ExecuteSql(
+                    $"DELETE FROM \"SyncOutbox\" WHERE \"Table\" = {table} AND \"LocalId\" = {localId} AND \"Error\" IS NOT NULL");
             foreach (var entry in state.Entries)
             {
                 var table = entry.Table;
@@ -216,6 +228,13 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
         {
             var queuedAt = DateTime.Now.ToString(
                 "yyyy-MM-dd HH:mm:ss.FFFFFFF", CultureInfo.InvariantCulture);
+            foreach (var entry in state.Entries)
+                state.Replacements.Add((entry.Table, entry.Entry is null ? entry.LocalId :
+                    (int)entry.Entry.Property("Id").CurrentValue!));
+            foreach (var (table, localId) in state.Replacements)
+                await db.Database.ExecuteSqlAsync(
+                    $"DELETE FROM \"SyncOutbox\" WHERE \"Table\" = {table} AND \"LocalId\" = {localId} AND \"Error\" IS NOT NULL",
+                    cancellationToken);
             foreach (var entry in state.Entries)
             {
                 var table = entry.Table;
@@ -291,6 +310,8 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
                 foreach (var id in DependentIds(db, child.Name, key.Properties[0].Name, parent.Id))
                 {
                     var candidate = (child.ClrType, id);
+                    if (!CurrentCascade(db, child.ClrType, id, key.Properties[0].Name,
+                        parent.Id)) continue;
                     if (!seen.Add(candidate)) continue;
                     queue.Enqueue(candidate);
                     state.Entries.Add(new Pending(null, child.Name, id, true, null));
@@ -321,12 +342,25 @@ public sealed class SyncCaptureInterceptor(SyncSignal signal) : SaveChangesInter
                 foreach (var id in ids)
                 {
                     var candidate = (child.ClrType, id);
+                    if (!CurrentCascade(db, child.ClrType, id, key.Properties[0].Name,
+                        parent.Id)) continue;
                     if (!seen.Add(candidate)) continue;
                     queue.Enqueue(candidate);
                     state.Entries.Add(new Pending(null, child.Name, id, true, null));
                 }
             }
         }
+    }
+
+    private static bool CurrentCascade(
+        AppDbContext db, Type type, int id, string foreignKey, int parentId)
+    {
+        var tracked = db.ChangeTracker.Entries().FirstOrDefault(entry =>
+            entry.Metadata.ClrType == type && entry.State != EntityState.Detached &&
+            (int)entry.Property("Id").CurrentValue! == id);
+        return tracked is null ||
+            (tracked.State != EntityState.Added &&
+                Equals(tracked.Property(foreignKey).CurrentValue, parentId));
     }
 
     private static List<int> DependentIds(

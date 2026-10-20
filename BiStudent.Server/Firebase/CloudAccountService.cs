@@ -112,6 +112,19 @@ public sealed class CloudAccountService(
         Teacher teacher, string currentPassword, string newPassword,
         CancellationToken cancellationToken)
     {
+        await loginGate.WaitAsync(cancellationToken);
+        try
+        {
+            await ChangePasswordCoreAsync(
+                teacher, currentPassword, newPassword, cancellationToken);
+        }
+        finally { loginGate.Release(); }
+    }
+
+    private async Task ChangePasswordCoreAsync(
+        Teacher teacher, string currentPassword, string newPassword,
+        CancellationToken cancellationToken)
+    {
         if (!Enabled) return;
         if (teacher.FirebaseUid is not null)
         {
@@ -129,7 +142,7 @@ public sealed class CloudAccountService(
                 }
                 var changed = await auth.ChangePasswordAsync(
                     session.IdToken, newPassword, cancellationToken);
-                sessions.Set(changed, teacher.Id);
+                AcceptSession(changed, teacher.Id);
             }
             catch (FirebaseUnavailableException exception)
             {
@@ -209,9 +222,11 @@ public sealed class CloudAccountService(
         }
 
         var previousUid = teacher.FirebaseUid;
+        var previousMustChangePassword = teacher.MustChangePassword;
         try
         {
-            teacher.FirebaseUid = created.Uid;
+            SetFirebaseUid(teacher, created.Uid);
+            if (existing) teacher.MustChangePassword = true;
             await SaveRemoteAsync(cancellationToken);
             var cloudId = await sync.EnsureLinkAsync(db, "Teachers", teacher.Id);
             await firestore.CommitAsync(admin.IdToken,
@@ -228,7 +243,8 @@ public sealed class CloudAccountService(
         {
             try
             {
-                teacher.FirebaseUid = previousUid;
+                SetFirebaseUid(teacher, previousUid);
+                teacher.MustChangePassword = previousMustChangePassword;
                 await SaveRemoteAsync(CancellationToken.None);
             }
             catch (Exception exception)
@@ -257,6 +273,10 @@ public sealed class CloudAccountService(
             ? "Логин связан с учётной записью Firebase и не меняется."
             : null;
 
+    private static bool IsTrue(FirestoreDocument document, string field) =>
+        document.Fields.TryGetValue(field, out var value) &&
+        value.TryGetProperty("booleanValue", out var flag) && flag.ValueKind == System.Text.Json.JsonValueKind.True;
+
     private async Task<CloudLoginResult> LinkAndAcceptAsync(
         FirebaseSession session, Teacher? local, string password,
         CancellationToken cancellationToken)
@@ -269,6 +289,13 @@ public sealed class CloudAccountService(
             {
                 try
                 {
+                    // Активность проверяем по самому облачному документу: локальная копия могла не обновиться
+                    // (например, из-за неотправленных правок). Отключённому правила не дадут даже прочитать его.
+                    var cloudTeacher = mapping.IdFromTeacher() is { } teacherCloudId
+                        ? await firestore.GetAsync(session.IdToken, "Teachers", teacherCloudId, cancellationToken)
+                        : null;
+                    if (cloudTeacher is null || !IsTrue(cloudTeacher, "IsActive") || IsTrue(cloudTeacher, "_deleted"))
+                        return Failure(403, "Учётная запись отключена. Обратитесь к администратору.");
                     await sync.PullAsync(["Teachers"], cancellationToken, session);
                     db.ChangeTracker.Clear();
                     var teacher = await db.Teachers.SingleOrDefaultAsync(
@@ -282,6 +309,9 @@ public sealed class CloudAccountService(
                         return Failure(403,
                             "Учётная запись не найдена в облаке BiStudent. Обратитесь к администратору.");
                     }
+                    if (!teacher!.IsActive)
+                        return Failure(403,
+                            "Учётная запись отключена. Обратитесь к администратору.");
                     AcceptSession(session, teacher!.Id);
                     return new CloudLoginResult(teacher, 200, null, true);
                 }
@@ -294,12 +324,12 @@ public sealed class CloudAccountService(
                 }
             }
 
-            if (local is { IsAdmin: true, FirebaseUid: null } &&
+            if (local is { IsAdmin: true, IsActive: true, FirebaseUid: null } &&
                 Matches(local, password) &&
                 await firestore.GetAsync(
                     session.IdToken, "meta", "bootstrap", cancellationToken) is null)
             {
-                local.FirebaseUid = session.Uid;
+                SetFirebaseUid(local, session.Uid);
                 await SaveRemoteAsync(cancellationToken);
                 try
                 {
@@ -317,7 +347,7 @@ public sealed class CloudAccountService(
                 }
                 catch
                 {
-                    local.FirebaseUid = null;
+                    SetFirebaseUid(local, null);
                     await SaveRemoteAsync(CancellationToken.None);
                     throw;
                 }
@@ -346,10 +376,28 @@ public sealed class CloudAccountService(
                             new Dictionary<string, object?> { ["teacher"] = link.CloudId },
                             MustExist: false, ServerTimestamp: false)
                     ], cancellationToken);
-                    local.FirebaseUid = session.Uid;
-                    await SaveRemoteAsync(cancellationToken);
-                    AcceptSession(session, local.Id);
-                    return new CloudLoginResult(local, 200, null, true);
+                    try
+                    {
+                        await sync.PullAsync(["Teachers"], cancellationToken, session);
+                    }
+                    catch (FirestorePermissionException exception)
+                    {
+                        logger.LogWarning(exception,
+                            "Доступ к привязке Firebase {Uid} запрещён", session.Uid);
+                        return Failure(403,
+                            "Учётная запись отключена. Обратитесь к администратору.");
+                    }
+                    db.ChangeTracker.Clear();
+                    var teacher = await db.Teachers.SingleOrDefaultAsync(
+                        candidate => candidate.FirebaseUid == session.Uid, cancellationToken);
+                    if (teacher is null)
+                        return Failure(403,
+                            "Учётная запись не найдена в облаке BiStudent. Обратитесь к администратору.");
+                    if (!teacher.IsActive)
+                        return Failure(403,
+                            "Учётная запись отключена. Обратитесь к администратору.");
+                    AcceptSession(session, teacher.Id);
+                    return new CloudLoginResult(teacher, 200, null, true);
                 }
             }
 
@@ -371,8 +419,15 @@ public sealed class CloudAccountService(
     {
         var previousUid = sessions.Uid;
         sessions.Set(session, teacherId);
-        if (previousUid is not null && previousUid != session.Uid)
+        if (previousUid != session.Uid)
             sync.Reset();
+    }
+
+    private static void SetFirebaseUid(Teacher teacher, string? uid)
+    {
+        if (teacher.FirebaseUid == uid) return;
+        teacher.FirebaseUid = uid;
+        teacher.SecurityStamp = Guid.NewGuid().ToString("N");
     }
 
     private CloudLoginResult Unlinked(Teacher? local, string password, string reason)

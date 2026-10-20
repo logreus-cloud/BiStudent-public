@@ -26,6 +26,34 @@ public sealed class FirebaseSyncScenarioTests : IDisposable
     public FirebaseSyncScenarioTests() => Directory.CreateDirectory(directory);
 
     [Fact]
+    public async Task StrangerCannotCaptureBootstrap()
+    {
+        await ClearAsync();
+        using var http = new HttpClient();
+        var stranger = await SignUpAsync(http, "stranger@bistudent.app", "Stranger-pass-1");
+        Assert.Equal(HttpStatusCode.Forbidden,
+            await CommitAsync(http, stranger.Token, new JsonObject
+            {
+                ["update"] = new JsonObject
+                {
+                    ["name"] = DocumentName("meta/bootstrap"),
+                    ["fields"] = new JsonObject { ["uid"] = StringValue(stranger.Uid) }
+                }
+            }));
+
+        using var factory = Factory("a");
+        using var client = factory.CreateClient();
+        await BootstrapAsync(client);
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var uid = await db.Teachers.Where(teacher => teacher.Login == "admin")
+            .Select(teacher => teacher.FirebaseUid).SingleAsync();
+        var bootstrap = await OwnerDocumentAsync(http, "meta/bootstrap");
+        Assert.NotNull(bootstrap);
+        Assert.Equal(uid, Field(bootstrap, "uid"));
+    }
+
+    [Fact]
     public async Task ChangesTravelBothWaysIncludingEditsAndDeletion()
     {
         await ClearAsync();
@@ -127,6 +155,49 @@ public sealed class FirebaseSyncScenarioTests : IDisposable
         using var second = Factory("b");
         using var secondClient = second.CreateClient();
         Authorize(secondClient, await LoginAsync(secondClient, "petrov", "Petrov-pass-1"));
+    }
+
+    [Fact]
+    public async Task DisabledLegacyTeacherCannotClaimWithStaleLocalCache()
+    {
+        await ClearAsync();
+        using var factory = Factory("a");
+        using var adminClient = factory.CreateClient();
+        await BootstrapAsync(adminClient);
+        await AddLegacyTeacherAsync(factory);
+        await RunAsync(adminClient);
+
+        int teacherId;
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            teacherId = await db.Teachers.Where(teacher => teacher.Login == "petrov")
+                .Select(teacher => teacher.Id).SingleAsync();
+        }
+        var disabled = await adminClient.PutAsJsonAsync(
+            $"/api/admin/teachers/{teacherId}",
+            new SaveTeacherRequest("petrov", "Петров", false, false));
+        Assert.Equal(HttpStatusCode.OK, disabled.StatusCode);
+        await RunAsync(adminClient);
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var teacher = await db.Teachers.SingleAsync(candidate => candidate.Id == teacherId);
+            var applyingRemote = db.ApplyingRemote;
+            db.ApplyingRemote = true;
+            try
+            {
+                teacher.IsActive = true;
+                await db.SaveChangesAsync();
+            }
+            finally { db.ApplyingRemote = applyingRemote; }
+        }
+
+        using var petrovClient = factory.CreateClient();
+        var login = await petrovClient.PostAsJsonAsync(
+            "/api/auth/login", new LoginRequest("petrov", "Petrov-pass-1"));
+        Assert.Equal(HttpStatusCode.Forbidden, login.StatusCode);
     }
 
     [Fact]
