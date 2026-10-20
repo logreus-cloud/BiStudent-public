@@ -1,6 +1,7 @@
 using BiStudent.Contracts;
 using System.Globalization;
 using BiStudent.Server.Data;
+using BiStudent.Server.Firebase;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 
@@ -12,7 +13,8 @@ public sealed class SeedService(AppDbContext db, IConfiguration configuration, I
     public async Task SeedAsync()
     {
         if (await db.Teachers.AnyAsync()) return;
-        var demo = configuration.GetValue("Demo:Enabled", false);
+        // Демо-данные в облачном режиме ушли бы в общую базу, поэтому с Firebase создаётся только администратор.
+        var demo = configuration.GetValue("Demo:Enabled", false) && !FirebaseOptions.IsConfigured(configuration);
         var teacher = new Teacher {
             Login = demo ? configuration["Demo:Login"] ?? "teacher" : configuration["Setup:AdminLogin"] ?? "admin",
             FullName = demo ? configuration["Demo:TeacherName"] ?? "Преподаватель (демо)"

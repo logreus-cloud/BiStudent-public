@@ -19,7 +19,9 @@ builder.Logging.AddConsole();
 var configuredConnection = builder.Configuration.GetConnectionString("Default");
 var defaultData = builder.Configuration["Storage:DataDirectory"] ??
     (OperatingSystem.IsWindows()
-        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BiStudent")
+        // Облачная версия держит базу отдельно: иначе первый вход выгрузил бы в облако старую локальную базу со снимками лиц.
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            FirebaseOptions.IsConfigured(builder.Configuration) ? "BiStudent-Cloud" : "BiStudent")
         : Path.Combine(builder.Environment.ContentRootPath, "App_Data"));
 if (!Path.IsPathRooted(defaultData))
     defaultData = Path.Combine(builder.Environment.ContentRootPath, defaultData);

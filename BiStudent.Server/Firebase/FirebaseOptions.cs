@@ -13,5 +13,9 @@ public sealed class FirebaseOptions
     public bool Enabled => !string.IsNullOrWhiteSpace(ApiKey) &&
         !string.IsNullOrWhiteSpace(ProjectId);
 
+    public static bool IsConfigured(IConfiguration configuration) =>
+        !string.IsNullOrWhiteSpace(configuration["Firebase:ApiKey"]) &&
+        !string.IsNullOrWhiteSpace(configuration["Firebase:ProjectId"]);
+
     public string EmailFor(string login) => login.Trim().ToLowerInvariant() + "@" + EmailDomain;
 }
