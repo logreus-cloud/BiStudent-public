@@ -147,31 +147,36 @@ public static class ApiEndpoints
                 .Select(r => new AttendanceRowDto(r.StudentId, r.FullName, r.Status, r.Method, r.MarkedAt,
                     r.Reason, r.Comment, r.HasDocument, r.Score)).ToList();
         });
-        lessons.MapPut("/attendance", async (int slotId, DateOnly date, MarkRequest request, ClaimsPrincipal user, AppDbContext db, AttendanceService attendance) =>
+        lessons.MapPut("/attendance", async (int slotId, DateOnly date, MarkRequest request, ClaimsPrincipal user, AppDbContext db, ScheduleService schedule, AttendanceService attendance) =>
         {
             await EnsureSlotAsync(db, user, slotId);
+            await EnsureLessonAsync(schedule, slotId, date,
+                skipFuture: request.Status is null || request.Status == AttendanceStatus.Excused, allowMissing: request.Status is null);
             if (request.Status is AttendanceStatus status) await attendance.MarkAsync(slotId, date, request.StudentId,
                 status, MarkMethod.Manual, request.Reason, request.Comment, request.HasDocument);
             else await attendance.ClearAsync(slotId, date, request.StudentId);
             return Results.NoContent();
         });
-        lessons.MapPost("/finish", async (int slotId, DateOnly date, ClaimsPrincipal user, AppDbContext db, AttendanceService attendance) =>
+        lessons.MapPost("/finish", async (int slotId, DateOnly date, ClaimsPrincipal user, AppDbContext db, ScheduleService schedule, AttendanceService attendance) =>
         {
             await EnsureSlotAsync(db, user, slotId);
+            await EnsureLessonAsync(schedule, slotId, date);
             return new CountResult(await attendance.MarkRestAbsentAsync(slotId, date));
         });
-        lessons.MapPost("/all-present", async (int slotId, DateOnly date, ClaimsPrincipal user, AppDbContext db, AttendanceService attendance) =>
+        lessons.MapPost("/all-present", async (int slotId, DateOnly date, ClaimsPrincipal user, AppDbContext db, ScheduleService schedule, AttendanceService attendance) =>
         {
             await EnsureSlotAsync(db, user, slotId);
+            await EnsureLessonAsync(schedule, slotId, date);
             var count = 0;
             foreach (var row in (await attendance.ForLessonAsync(slotId, date)).Where(r => r.Status is null))
                 if (await attendance.MarkAsync(slotId, date, row.StudentId, AttendanceStatus.Present, MarkMethod.Manual, onlyIfUnmarked: true)) count++;
             return new CountResult(count);
         });
 
-        api.MapPost("/recognize", async (RecognizeRequest request, ClaimsPrincipal user, AppDbContext db, RecognitionService recognition) =>
+        api.MapPost("/recognize", async (RecognizeRequest request, ClaimsPrincipal user, AppDbContext db, ScheduleService schedule, RecognitionService recognition) =>
         {
             await EnsureSlotAsync(db, user, request.SlotId);
+            await EnsureLessonAsync(schedule, request.SlotId, request.Date);
             return await recognition.RecognizeAsync(TeacherId(user), request.SlotId, request.Date, request.Image);
         }).WithMetadata(new RequestSizeLimitAttribute(4 * 1024 * 1024));
         api.MapGet("/recognition/status", async (RecognitionService recognition, FaceSampleHealth health) =>
@@ -227,6 +232,20 @@ public static class ApiEndpoints
         var teacherId = TeacherId(user);
         if (!await db.ScheduleSlots.AnyAsync(x => x.Id == slotId && x.TeacherId == teacherId))
             throw new KeyNotFoundException("Пара не найдена в вашем расписании.");
+    }
+
+    internal static async Task EnsureLessonAsync(ScheduleService schedule, int slotId, DateOnly date,
+        bool skipFuture = false, bool allowMissing = false)
+    {
+        var lesson = await schedule.OccurrenceAsync(slotId, date);
+        if (lesson is null)
+        {
+            if (allowMissing) return;
+            throw new InvalidOperationException("Пары в указанную дату нет.");
+        }
+        if (lesson.Cancelled) throw new InvalidOperationException("Пара отменена.");
+        if (!skipFuture && date > DateOnly.FromDateTime(DateTime.Now))
+            throw new InvalidOperationException("Пара ещё не прошла.");
     }
 
     /// Менять состав группы может администратор, преподаватель с парами в ней или любой — если у группы ещё нет расписания.

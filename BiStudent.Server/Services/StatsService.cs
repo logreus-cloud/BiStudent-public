@@ -33,6 +33,11 @@ public sealed class StatsService(AppDbContext db, ScheduleService schedule, ICon
         for (var day = from; day <= today; day = day.AddDays(1))
             occurrences.AddRange((await schedule.ForDayAsync(teacherId, day))
                 .Where(x => !x.Cancelled && x.EndsAt <= now));
+        var slotIds = occurrences.Select(x => x.Slot.Id).Distinct().ToArray();
+        var marks = await db.AttendanceMarks.AsNoTracking()
+            .Where(x => slotIds.Contains(x.SlotId) && x.Date >= from && x.Date <= today).ToListAsync();
+        var markedLessons = marks.Select(x => (x.SlotId, x.Date)).ToHashSet();
+        occurrences = occurrences.Where(x => markedLessons.Contains((x.Slot.Id, x.Date))).ToList();
         var todayLessons = await schedule.ForDayAsync(teacherId, today);
         var next = todayLessons.FirstOrDefault(x => !x.Cancelled && x.EndsAt > now);
         var groupIds = occurrences.Select(x => x.Slot.GroupId).Distinct().ToArray();
@@ -45,9 +50,6 @@ public sealed class StatsService(AppDbContext db, ScheduleService schedule, ICon
         bool InGroup(int studentId, int groupId, DateOnly date) =>
             membershipMap.TryGetValue(studentId, out var periods) &&
             periods.Any(x => x.GroupId == groupId && x.From <= date && (x.To is null || x.To >= date));
-        var slotIds = occurrences.Select(x => x.Slot.Id).Distinct().ToArray();
-        var marks = await db.AttendanceMarks.AsNoTracking()
-            .Where(x => slotIds.Contains(x.SlotId) && x.Date >= from && x.Date <= today).ToListAsync();
         var markMap = marks.ToDictionary(x => (x.SlotId, x.Date, x.StudentId));
 
         double Percent(IEnumerable<LessonOccurrence> lessons, IEnumerable<Student> people)
@@ -67,7 +69,7 @@ public sealed class StatsService(AppDbContext db, ScheduleService schedule, ICon
 
         var groupNames = await db.Groups.AsNoTracking().Where(x => groupIds.Contains(x.Id))
             .Select(x => new { x.Id, x.Name }).ToListAsync();
-        var groups = groupNames.Select(group =>
+        var groups = groupNames.Where(group => occurrences.Any(x => x.Slot.GroupId == group.Id)).Select(group =>
             new GroupAttendance(group.Id, group.Name,
                 Percent(occurrences.Where(x => x.Slot.GroupId == group.Id), students))).OrderBy(x => x.GroupName).ToList();
         var risk = new List<AtRiskStudent>();

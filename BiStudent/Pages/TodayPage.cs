@@ -134,7 +134,10 @@ internal sealed class TodayPage : Page
                 currentRows = await Api.AttendanceAsync(live.Slot.Id, live.Date);
                 if (Gone) return;
             }
-            attendance.Set(UiFormat.Percent(data.Attendance7Days), $"за 30 дней — {UiFormat.Percent(data.Attendance30Days)}", UiFormat.PercentColor(data.Attendance7Days));
+            var has7Days = data.Trend.Any(x => x.Date >= DateOnly.FromDateTime(now).AddDays(-6));
+            attendance.Set(has7Days ? UiFormat.Percent(data.Attendance7Days) : "—",
+                data.Trend.Count == 0 ? "посещаемость ещё не отмечали" : $"за 30 дней — {UiFormat.Percent(data.Attendance30Days)}",
+                has7Days ? UiFormat.PercentColor(data.Attendance7Days) : Theme.Muted);
             automatic.Set(data.CameraMarks7Days.ToString(), $"за месяц — {data.CameraMarks30Days}");
             score.Set(data.AverageScore30Days is { } average ? average.ToString("0.0") : "—", "по 100-балльной шкале");
             risk.Set(data.AtRisk.Count.ToString(), "студентов требуют внимания", data.AtRisk.Count > 0 ? Theme.Red : Theme.Green);
@@ -142,7 +145,7 @@ internal sealed class TodayPage : Page
             pendingText.Text = $"Заявки на регистрацию лица: {data.PendingFaceSubmissions}";
             BuildNow(data, now, currentRows);
             BuildLessons(now, percents);
-            BuildRisk(data.AtRisk);
+            BuildRisk(data.AtRisk, data.Trend.Count > 0);
             if (!left) refresh.Start();
         }
         finally { loading = false; }
@@ -229,14 +232,14 @@ internal sealed class TodayPage : Page
         finally { lessons.EndUpdate(); }
     }
 
-    private void BuildRisk(List<AtRiskStudentDto> students)
+    private void BuildRisk(List<AtRiskStudentDto> students, bool hasData)
     {
         riskList.SuspendLayout();
         foreach (Control control in riskList.Controls.Cast<Control>().ToList()) control.Dispose();
         riskList.Controls.Clear();
         if (students.Count == 0)
         {
-            var ok = Ui.Label("Все студенты посещают занятия стабильно.", 10, Theme.Muted);
+            var ok = Ui.Label(hasData ? "Все студенты посещают занятия стабильно." : "Посещаемость за 30 дней ещё не отмечали.", 10, Theme.Muted);
             ok.Dock = DockStyle.None; ok.AutoSize = true;
             riskList.Controls.Add(ok);
         }

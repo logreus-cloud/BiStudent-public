@@ -264,8 +264,9 @@ internal sealed class JournalPage : Page
             var summary = entries.Count + 2;
             row.Cells[summary].Value = student.MissedHours;
             row.Cells[summary].ToolTipText = $"Из них по уважительной: {student.ExcusedHours} ч";
-            row.Cells[summary + 1].Value = UiFormat.Percent(student.Percent);
-            row.Cells[summary + 1].Style.ForeColor = student.Percent >= 85 ? Theme.Green : student.Percent >= 70 ? Theme.Yellow : Theme.Red;
+            row.Cells[summary + 1].Value = student.Present + student.Absent + student.Excused == 0 ? "—" : UiFormat.Percent(student.Percent);
+            row.Cells[summary + 1].Style.ForeColor = student.Present + student.Absent + student.Excused == 0
+                ? Theme.Muted : student.Percent >= 85 ? Theme.Green : student.Percent >= 70 ? Theme.Yellow : Theme.Red;
             row.Cells[summary + 1].Style.Font = Theme.Font(10, FontStyle.Bold);
             if (SelectedSubject is not null)
             {

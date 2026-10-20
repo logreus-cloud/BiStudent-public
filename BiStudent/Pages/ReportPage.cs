@@ -214,8 +214,9 @@ internal sealed class ReportPage : Page
             saved.Set($"{UiFormat.Hours(data.Dashboard.SavedMinutes30Days)} ч", "за месяц", Theme.Text);
             camera.Set(data.Dashboard.CameraMarks30Days.ToString("N0"), "камерой за 30 дней", Theme.Green);
             exports.Set(data.ReportsExported30Days.ToString("N0"), "в Excel одной кнопкой", Theme.Violet);
-            attendance.Set(UiFormat.Percent(data.Dashboard.Attendance30Days),
-                $"{data.Dashboard.AtRisk.Count} в зоне риска", UiFormat.PercentColor(data.Dashboard.Attendance30Days));
+            attendance.Set(data.Dashboard.Trend.Count == 0 ? "—" : UiFormat.Percent(data.Dashboard.Attendance30Days),
+                data.Dashboard.Trend.Count == 0 ? "посещаемость ещё не отмечали" : $"{data.Dashboard.AtRisk.Count} в зоне риска",
+                data.Dashboard.Trend.Count == 0 ? Theme.Muted : UiFormat.PercentColor(data.Dashboard.Attendance30Days));
             var rollCall = data.AverageGroupSize * data.SecondsPerManualMark / 60d;
             manualRollCall.Text = $"Устная перекличка ≈ {rollCall:0.#} мин на занятие";
             rollCallDetail.Text = $"{data.AverageGroupSize} студентов × {data.SecondsPerManualMark} сек на фамилию и отметку";
