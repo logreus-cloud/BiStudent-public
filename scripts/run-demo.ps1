@@ -2,11 +2,12 @@
 .SYNOPSIS
   Запускает BiStudent: сервер на порту 5080 (доступен в локальной сети) и клиент преподавателя (WinForms).
 .PARAMETER Demo
-  При первом запуске на пустой базе заполнить её демонстрационными данными
+  Запустить без облака (Firebase выключен) и на пустой базе заполнить её демонстрационными данными
   (преподаватель teacher / teacher123, группы, расписание, история посещаемости и оценок).
   Без этого ключа создаётся администратор admin / admin, пароль нужно сменить при первом входе.
 .PARAMETER Reset
-  Удалить базу сервера перед запуском (C:\ProgramData\BiStudent). Все данные будут потеряны.
+  Удалить базу сервера перед запуском (C:\ProgramData\BiStudent-Cloud, с -Demo — C:\ProgramData\BiStudent).
+  Все данные на этом компьютере будут потеряны; данные в облаке Firebase не удаляются.
 #>
 param([switch]$Demo, [switch]$Reset)
 
@@ -22,7 +23,7 @@ if (-not (dotnet --list-sdks | Select-String '^10\.')) {
 }
 
 if ($Reset) {
-    $data = Join-Path $env:ProgramData 'BiStudent'
+    $data = Join-Path $env:ProgramData ($(if ($Demo) { 'BiStudent' } else { 'BiStudent-Cloud' }))
     if (Test-Path $data) { Remove-Item -Recurse -Force $data; Write-Host "База удалена: $data" }
 }
 
@@ -31,6 +32,7 @@ dotnet build (Join-Path $root 'BiStudent.slnx') -c Release -v q | Out-Host
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 if ($Demo) {
+    # С Firebase демо-данные ушли бы в общую облачную базу, поэтому демо работает только локально.
     $env:Demo__Enabled = 'true'
     # Реальное расписание и списки групп (seed/schedule.local.xlsx, seed/students.local.csv) подключаются, если лежат рядом.
     $env:Demo__UseLocalSchedule = 'true'
@@ -39,7 +41,9 @@ if ($Demo) {
 }
 
 Write-Host "Запуск сервера на порту $port…"
-$serverProcess = Start-Process dotnet -ArgumentList @('run', '--project', $server, '-c', 'Release', '--no-build', '--no-launch-profile', '--urls', "http://*:$port") `
+$serverArgs = @('run', '--project', $server, '-c', 'Release', '--no-build', '--no-launch-profile', '--urls', "http://*:$port")
+if ($Demo) { $serverArgs += '--Firebase:ApiKey=' }
+$serverProcess = Start-Process dotnet -ArgumentList $serverArgs `
     -WorkingDirectory $server -WindowStyle Minimized -PassThru
 
 $ready = $false

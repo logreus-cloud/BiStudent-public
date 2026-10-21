@@ -70,14 +70,14 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
         return false;
     }
 
-    private async Task ValidateAsync(ScheduleSlot slot)
+    private async Task ValidateAsync(ScheduleSlot slot, IReadOnlySet<int>? ignored = null)
     {
         if (slot.Start >= slot.End) throw new InvalidOperationException("Начало пары должно быть раньше окончания.");
         if (slot.ValidTo is DateOnly end && end < slot.ValidFrom) throw new InvalidOperationException("Конец периода раньше начала.");
         if (slot.OneOffDate is DateOnly once && (once < slot.ValidFrom || slot.ValidTo is DateOnly to && once > to))
             throw new InvalidOperationException("Разовое занятие вне периода действия.");
         var others = await db.ScheduleSlots.AsNoTracking().Where(x => x.TeacherId == slot.TeacherId && x.Id != slot.Id).ToListAsync();
-        if (others.Any(x => TimesOverlap(x, slot) && DatesOverlap(x, slot)))
+        if (others.Any(x => (ignored is null || !ignored.Contains(x.Id)) && TimesOverlap(x, slot) && DatesOverlap(x, slot)))
             throw new InvalidOperationException("У преподавателя уже есть пара в это время.");
     }
 
@@ -144,7 +144,7 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
         await using var transaction = await db.Database.BeginTransactionAsync();
         using var reader = new StreamReader(csv, leaveOpen: true);
         var errors = new List<string>();
-        var added = 0;
+        var parsed = new List<(ScheduleSlot Slot, int Line)>();
         var line = 0;
         while (await reader.ReadLineAsync() is { } raw)
         {
@@ -168,14 +168,15 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
                 };
                 var group = await db.Groups.SingleOrDefaultAsync(x => x.Name == parts[4]);
                 if (group is null) { group = new Group { Name = parts[4] }; db.Groups.Add(group); await db.SaveChangesAsync(); }
-                await AddSlotAsync(new ScheduleSlot {
+                var slot = new ScheduleSlot {
                     TeacherId = teacherId, GroupId = group.Id, DayOfWeek = day,
                     Start = TimeOnly.Parse(parts[1], CultureInfo.GetCultureInfo("ru-RU")),
                     End = TimeOnly.Parse(parts[2], CultureInfo.GetCultureInfo("ru-RU")),
                     Subject = parts[3], Room = string.IsNullOrWhiteSpace(parts[5]) ? null : parts[5],
                     Parity = parity, ValidFrom = SemesterStart
-                });
-                added++;
+                };
+                if (slot.Start >= slot.End) throw new InvalidOperationException("Начало пары должно быть раньше окончания.");
+                parsed.Add((slot, line));
             }
             catch (Exception ex) { errors.Add($"Строка {line}: {ex.Message}"); }
         }
@@ -184,7 +185,47 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
             await transaction.RollbackAsync();
             throw new InvalidOperationException(string.Join(Environment.NewLine, errors));
         }
+        var groupIds = parsed.Select(x => x.Slot.GroupId).Distinct().ToArray();
+        var existing = await db.ScheduleSlots
+            .Where(x => x.TeacherId == teacherId && groupIds.Contains(x.GroupId)).ToListAsync();
+        var unchanged = 0;
+        var added = 0;
+        var updated = 0;
+        var archived = new HashSet<int>();
+        var stored = new Dictionary<ScheduleSlot, ScheduleSlot>();
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        foreach (var group in parsed.GroupBy(x => x.Slot.GroupId))
+        {
+            var old = existing.Where(x => x.GroupId == group.Key).ToList();
+            var incoming = group.Select(x => x.Slot).ToList();
+            var comparison = await ScheduleReplacement.IsUnchangedAsync(db, old, incoming, today);
+            if (comparison.Unchanged)
+            {
+                unchanged++;
+                archived.UnionWith(comparison.ArchivedIds);
+                continue;
+            }
+            var replacement = await ScheduleReplacement.ReplaceAsync(db, old, incoming, today);
+            added += replacement.Added;
+            updated += replacement.Updated;
+            archived.UnionWith(replacement.ArchivedIds);
+            foreach (var (source, target) in replacement.Slots) stored.Add(source, target);
+        }
+        if (groupIds.Length > 0 && unchanged == groupIds.Length)
+            throw new InvalidOperationException(ScheduleReplacement.AlreadyLoadedMessage);
+        await db.SaveChangesAsync();
+        foreach (var (slot, sourceLine) in parsed)
+        {
+            if (!stored.TryGetValue(slot, out var target)) continue;
+            try { await ValidateAsync(target, archived); }
+            catch (InvalidOperationException ex) { errors.Add($"Строка {sourceLine}: {ex.Message}"); }
+        }
+        if (errors.Count > 0)
+        {
+            await transaction.RollbackAsync();
+            throw new InvalidOperationException(string.Join(Environment.NewLine, errors));
+        }
         await transaction.CommitAsync();
-        return added;
+        return added + updated;
     }
 }

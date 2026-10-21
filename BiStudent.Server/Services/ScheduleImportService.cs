@@ -7,15 +7,33 @@ using Microsoft.EntityFrameworkCore;
 namespace BiStudent.Server.Services;
 
 /// Импорт расписания колледжа (см. CollegeScheduleParser) в базу: группы, учётные записи преподавателей и занятия.
-/// Повторный импорт того же файла ничего не дублирует: совпадающие занятия пропускаются.
+/// Повторный импорт заменяет расписание выбранных групп, сохраняя занятия с данными журнала.
 public sealed class ScheduleImportService(AppDbContext db, AccountService accounts, IConfiguration configuration)
 {
     public async Task<ScheduleImportPreviewDto> PreviewAsync(Stream xlsx)
     {
         var parsed = Parse(xlsx);
-        var existing = (await db.Groups.AsNoTracking().Select(x => x.Name).ToListAsync()).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var groups = parsed.Groups.Select(g => new ScheduleImportGroupDto(g.Sheet, g.Group,
-            parsed.Lessons.Count(x => x.Group == g.Group), existing.Contains(g.Group))).ToList();
+        var storedGroups = await db.Groups.AsNoTracking().ToListAsync();
+        var groupIds = storedGroups.ToDictionary(x => x.Name, x => x.Id, StringComparer.OrdinalIgnoreCase);
+        var teacherNames = parsed.Lessons.Select(x => x.Teacher).Distinct().ToList();
+        var storedTeachers = await db.Teachers.AsNoTracking().Where(x => teacherNames.Contains(x.FullName)).ToListAsync();
+        var teacherIds = storedTeachers.GroupBy(x => x.FullName).ToDictionary(x => x.Key, x => x.First().Id);
+        var nextId = 0;
+        foreach (var name in teacherNames)
+            if (!teacherIds.ContainsKey(name)) teacherIds[name] = --nextId;
+        var slots = await db.ScheduleSlots.AsNoTracking()
+            .Where(x => groupIds.Values.Contains(x.GroupId)).ToListAsync();
+        var groups = new List<ScheduleImportGroupDto>();
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        foreach (var group in parsed.Groups)
+        {
+            var exists = groupIds.TryGetValue(group.Group, out var groupId);
+            var lessons = parsed.Lessons.Where(x => x.Group == group.Group).ToList();
+            var incoming = exists ? lessons.Select(x => ToSlot(x, groupId, teacherIds[x.Teacher], parsed.SemesterStart)).ToList() : [];
+            var old = slots.Where(x => x.GroupId == groupId).ToList();
+            groups.Add(new ScheduleImportGroupDto(group.Sheet, group.Group, lessons.Count, exists,
+                exists && (await ScheduleReplacement.IsUnchangedAsync(db, old, incoming, today)).Unchanged));
+        }
         var teachers = parsed.Lessons.Select(x => x.Teacher).Distinct().Order(StringComparer.CurrentCulture).ToList();
         return new ScheduleImportPreviewDto(parsed.SemesterStart, groups, teachers, parsed.Warnings);
     }
@@ -36,7 +54,8 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
         await using var transaction = await db.Database.BeginTransactionAsync();
         var groupsCreated = 0;
         var groupIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var name in lessons.Select(x => x.Group).Distinct())
+        var groupNames = parsed.Groups.Select(x => x.Group).Where(selected.Contains).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var name in groupNames)
         {
             var group = await db.Groups.SingleOrDefaultAsync(x => x.Name == name);
             if (group is null) { group = new Group { Name = name }; db.Groups.Add(group); await db.SaveChangesAsync(); groupsCreated++; }
@@ -61,38 +80,33 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
             teachers.Add(new ImportedTeacherDto(name, login, vacancy ? null : created.Password, true, !vacancy));
         }
 
-        var existingSlots = await db.ScheduleSlots.AsNoTracking()
+        var existingSlots = await db.ScheduleSlots
             .Where(x => groupIds.Values.Contains(x.GroupId)).ToListAsync();
-        var keys = existingSlots.Select(Key).ToHashSet();
         var added = 0;
-        var skipped = 0;
-        foreach (var lesson in lessons)
+        var updated = 0;
+        var removed = 0;
+        var unchanged = new List<string>();
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        foreach (var name in groupNames)
         {
-            var monday = parsed.SemesterStart.AddDays(7 * (lesson.FromWeek - 1));
-            var offset = ((int)lesson.Day + 6) % 7;
-            var slot = new ScheduleSlot
+            var old = existingSlots.Where(x => x.GroupId == groupIds[name]).ToList();
+            var incoming = lessons.Where(x => x.Group.Equals(name, StringComparison.OrdinalIgnoreCase))
+                .Select(x => ToSlot(x, groupIds[name], teacherIds[x.Teacher], parsed.SemesterStart)).ToList();
+            if ((await ScheduleReplacement.IsUnchangedAsync(db, old, incoming, today)).Unchanged)
             {
-                TeacherId = teacherIds[lesson.Teacher], GroupId = groupIds[lesson.Group],
-                Subject = lesson.Subject.Length > 200 ? lesson.Subject[..200] : lesson.Subject, Room = lesson.Room,
-                DayOfWeek = lesson.Day, Start = lesson.Start, End = lesson.End, Parity = WeekParity.Every
-            };
-            if (lesson.Once)
-            {
-                var date = monday.AddDays(offset);
-                slot.OneOffDate = date; slot.ValidFrom = date; slot.ValidTo = date;
+                unchanged.Add(name);
+                continue;
             }
-            else
-            {
-                slot.ValidFrom = monday;
-                slot.ValidTo = parsed.SemesterStart.AddDays(7 * lesson.ToWeek - 1);
-            }
-            if (!keys.Add(Key(slot))) { skipped++; continue; }
-            db.ScheduleSlots.Add(slot);
-            added++;
+            var replacement = await ScheduleReplacement.ReplaceAsync(db, old, incoming, today);
+            added += replacement.Added;
+            updated += replacement.Updated;
+            removed += replacement.Removed;
         }
+        if (unchanged.Count == groupNames.Count)
+            throw new InvalidOperationException(ScheduleReplacement.AlreadyLoadedMessage);
         await db.SaveChangesAsync();
         await transaction.CommitAsync();
-        return new ScheduleImportResultDto(added, skipped, groupsCreated, teachers, warnings);
+        return new ScheduleImportResultDto(added, 0, groupsCreated, teachers, warnings, updated, removed, unchanged);
     }
 
     private ParsedSchedule Parse(Stream xlsx)
@@ -105,8 +119,30 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
         }
     }
 
-    private static (int, int, string, DayOfWeek, TimeOnly, TimeOnly, DateOnly, DateOnly?, DateOnly?, string?) Key(ScheduleSlot x) =>
-        (x.TeacherId, x.GroupId, x.Subject, x.DayOfWeek, x.Start, x.End, x.ValidFrom, x.ValidTo, x.OneOffDate, x.Room);
+    private static ScheduleSlot ToSlot(ParsedLesson lesson, int groupId, int teacherId, DateOnly semesterStart)
+    {
+        var monday = semesterStart.AddDays(7 * (lesson.FromWeek - 1));
+        var offset = ((int)lesson.Day + 6) % 7;
+        var slot = new ScheduleSlot
+        {
+            TeacherId = teacherId, GroupId = groupId,
+            Subject = lesson.Subject.Length > 200 ? lesson.Subject[..200] : lesson.Subject, Room = lesson.Room,
+            DayOfWeek = lesson.Day, Start = lesson.Start, End = lesson.End, Parity = WeekParity.Every
+        };
+        if (lesson.Once)
+        {
+            var date = monday.AddDays(offset);
+            slot.OneOffDate = date;
+            slot.ValidFrom = date;
+            slot.ValidTo = date;
+        }
+        else
+        {
+            slot.ValidFrom = monday;
+            slot.ValidTo = semesterStart.AddDays(7 * lesson.ToWeek - 1);
+        }
+        return slot;
+    }
 
     private static DateOnly Monday(DateOnly date) => date.AddDays(-(((int)date.DayOfWeek + 6) % 7));
 

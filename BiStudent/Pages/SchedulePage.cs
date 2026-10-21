@@ -188,7 +188,7 @@ internal sealed class SchedulePage : Page
         }
         var result = await Api.ImportScheduleAsync(content);
         if (result.Errors.Count > 0) Ui.Message(FindForm(), "Ошибки импорта", string.Join(Environment.NewLine, result.Errors));
-        else Ui.Toast(this, $"Добавлено {result.Added} {UiFormat.Plural(result.Added, "пара", "пары", "пар")}");
+        else Ui.Toast(this, $"Импортировано {result.Added} {UiFormat.Plural(result.Added, "занятие", "занятия", "занятий")}");
         await RefreshAsync();
     }
 

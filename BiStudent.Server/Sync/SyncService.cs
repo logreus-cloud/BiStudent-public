@@ -35,8 +35,10 @@ public sealed class SyncService(
         .GetMethod(nameof(LoadCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
     private static readonly MethodInfo MissingMethod = typeof(SyncService)
         .GetMethod(nameof(MissingCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
-    private static readonly MethodInfo UniqueMethod = typeof(SyncService)
-        .GetMethod(nameof(FindUniqueCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
+    private static readonly MethodInfo KeyMethod = typeof(SyncService)
+        .GetMethod(nameof(FindKeyCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
+    private static readonly MethodInfo OtherKeyMethod = typeof(SyncService)
+        .GetMethod(nameof(FindOtherKeyCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
     private static readonly MethodInfo DependentsMethod = typeof(SyncService)
         .GetMethod(nameof(FindDependentsCoreAsync), BindingFlags.NonPublic | BindingFlags.Static)!;
 
@@ -761,7 +763,27 @@ public sealed class SyncService(
                     cancellationToken))
                     return ApplyResult.Deferred;
                 var row = await LoadAsync(db, table, link!.LocalId, true, cancellationToken);
-                if (row is not null) db.Remove(row);
+                if (row is not null)
+                {
+                    foreach (var key in table.NaturalKeys)
+                    {
+                        var values = key.Properties.ToDictionary(property => property.Name,
+                            property => db.Entry(row).Property(property.Name).CurrentValue);
+                        var canonical = await FindOtherKeyAsync(db, table, key, values,
+                            link.LocalId, document.Id, cancellationToken);
+                        if (canonical is null) continue;
+                        var canonicalId = (int)db.Entry(canonical).Property("Id").CurrentValue!;
+                        var canonicalLink = await db.SyncLinks.SingleAsync(candidate =>
+                            candidate.Table == table.Name && candidate.LocalId == canonicalId,
+                            cancellationToken);
+                        await TransferDependentsAsync(db, table, link.LocalId, canonicalId,
+                            cancellationToken);
+                        await AddAliasAsync(db, table.Name, document.Id, canonicalLink.CloudId,
+                            cancellationToken);
+                        break;
+                    }
+                    db.Remove(row);
+                }
                 db.SyncLinks.Remove(link);
                 await db.SaveChangesAsync(cancellationToken);
             }
@@ -827,11 +849,12 @@ public sealed class SyncService(
                 }
                 if (row is null && link is null)
                 {
-                    foreach (var index in table.UniqueIndexes)
+                    foreach (var key in table.UniqueIndexes.Select(index => new SyncKey(index.Properties, false))
+                        .Concat(table.NaturalKeys))
                     {
-                        if (index.Properties.Any(property => !values.ContainsKey(property.Name) ||
-                            values[property.Name] is null)) continue;
-                        row = await FindUniqueAsync(db, table, index, values, cancellationToken);
+                        if (key.Properties.Any(property => !values.ContainsKey(property.Name) ||
+                            values[property.Name] is null && (!key.NullsEqual || !property.IsNullable))) continue;
+                        row = await FindKeyAsync(db, table, key, values, cancellationToken);
                         if (row is not null) break;
                     }
                 }
@@ -1038,6 +1061,64 @@ public sealed class SyncService(
             }
     }
 
+    private static async Task TransferDependentsAsync(
+        AppDbContext db, SyncTable parent, int oldId, int canonicalId,
+        CancellationToken cancellationToken)
+    {
+        foreach (var child in new SyncModel(db).Tables)
+            foreach (var key in child.ForeignKeys.Where(key => key.PrincipalTable == parent.Name))
+            {
+                var ids = await (Task<List<int>>)DependentsMethod.MakeGenericMethod(child.ClrType)
+                    .Invoke(null, [db, key.Property, oldId, cancellationToken])!;
+                foreach (var id in ids)
+                {
+                    var row = await LoadAsync(db, child, id, true, cancellationToken);
+                    if (row is null || !Equals(db.Entry(row).Property(key.Property.Name).CurrentValue, oldId))
+                        continue;
+                    var conflict = false;
+                    foreach (var index in child.UniqueIndexes.Where(index => index.Properties.Contains(key.Property)))
+                    {
+                        var values = index.Properties.ToDictionary(property => property.Name,
+                            property => property.Name == key.Property.Name ? (object?)canonicalId :
+                                db.Entry(row).Property(property.Name).CurrentValue);
+                        if (values.Values.Any(value => value is null)) continue;
+                        var found = await FindKeyAsync(db, child, new SyncKey(index.Properties, false),
+                            values, cancellationToken);
+                        if (found is not null && (int)db.Entry(found).Property("Id").CurrentValue! != id)
+                            conflict = true;
+                        if (db.ChangeTracker.Entries().Any(entry =>
+                            entry.Metadata.ClrType == child.ClrType &&
+                            entry.State is not (EntityState.Detached or EntityState.Deleted) &&
+                            !Equals(entry.Property("Id").CurrentValue, id) &&
+                            index.Properties.All(property => Equals(
+                                entry.Property(property.Name).CurrentValue, values[property.Name]))))
+                            conflict = true;
+                        if (conflict) break;
+                    }
+                    if (conflict)
+                    {
+                        var pending = await db.SyncOutbox.Where(entry =>
+                            entry.Table == child.Name && entry.LocalId == id)
+                            .ToListAsync(cancellationToken);
+                        pending.AddRange(db.SyncOutbox.Local.Where(entry =>
+                            entry.Table == child.Name && entry.LocalId == id &&
+                            !pending.Contains(entry)));
+                        db.SyncOutbox.RemoveRange(pending);
+                        var link = await db.SyncLinks.FirstOrDefaultAsync(candidate =>
+                            candidate.Table == child.Name && candidate.LocalId == id,
+                            cancellationToken);
+                        if (link is not null) db.SyncLinks.Remove(link);
+                        db.Remove(row);
+                    }
+                    else
+                    {
+                        db.Entry(row).Property(key.Property.Name).CurrentValue = canonicalId;
+                        await QueueAsync(db, child.Name, id, cancellationToken);
+                    }
+                }
+            }
+    }
+
     private static Task<List<int>> FindDependentsCoreAsync<T>(
         AppDbContext db, IProperty property, int localId,
         CancellationToken cancellationToken) where T : class
@@ -1084,28 +1165,57 @@ public sealed class SyncService(
             .Select(row => EF.Property<int>(row, "Id"))
             .ToListAsync(cancellationToken);
 
-    private static Task<object?> FindUniqueAsync(
-        AppDbContext db, SyncTable table, IIndex index,
+    private static Task<object?> FindKeyAsync(
+        AppDbContext db, SyncTable table, SyncKey key,
         Dictionary<string, object?> values, CancellationToken cancellationToken) =>
-        (Task<object?>)UniqueMethod.MakeGenericMethod(table.ClrType)
-            .Invoke(null, [db, index, values, cancellationToken])!;
+        (Task<object?>)KeyMethod.MakeGenericMethod(table.ClrType)
+            .Invoke(null, [db, key, values, cancellationToken])!;
 
-    private static async Task<object?> FindUniqueCoreAsync<T>(
-        AppDbContext db, IIndex index, Dictionary<string, object?> values,
+    private static async Task<object?> FindKeyCoreAsync<T>(
+        AppDbContext db, SyncKey key, Dictionary<string, object?> values,
         CancellationToken cancellationToken) where T : class
+        => await db.Set<T>().FirstOrDefaultAsync(
+            KeyPredicate<T>(key, values), cancellationToken);
+
+    private static Task<object?> FindOtherKeyAsync(
+        AppDbContext db, SyncTable table, SyncKey key,
+        Dictionary<string, object?> values, int excludedId, string cloudId,
+        CancellationToken cancellationToken) =>
+        (Task<object?>)OtherKeyMethod.MakeGenericMethod(table.ClrType)
+            .Invoke(null, [db, table.Name, key, values, excludedId, cloudId, cancellationToken])!;
+
+    private static async Task<object?> FindOtherKeyCoreAsync<T>(
+        AppDbContext db, string table, SyncKey key, Dictionary<string, object?> values,
+        int excludedId, string cloudId, CancellationToken cancellationToken) where T : class =>
+        await db.Set<T>().Where(KeyPredicate<T>(key, values, excludedId))
+            .Where(row => db.SyncLinks.Any(link => link.Table == table &&
+                link.LocalId == EF.Property<int>(row, "Id") && link.CloudId != cloudId))
+            .OrderBy(row => EF.Property<int>(row, "Id"))
+            .FirstOrDefaultAsync(cancellationToken);
+
+    private static Expression<Func<T, bool>> KeyPredicate<T>(
+        SyncKey key, Dictionary<string, object?> values, int? excludedId = null)
     {
         var parameter = Expression.Parameter(typeof(T), "row");
         Expression? predicate = null;
-        foreach (var property in index.Properties)
+        foreach (var property in key.Properties)
         {
             var left = Expression.Call(typeof(EF), nameof(EF.Property),
                 [property.ClrType], parameter, Expression.Constant(property.Name));
-            var right = Expression.Convert(Expression.Constant(values[property.Name]),
-                property.ClrType);
+            var value = values[property.Name];
+            Expression right = value is null
+                ? Expression.Constant(null, property.ClrType)
+                : Expression.Convert(Expression.Constant(value), property.ClrType);
             var equal = Expression.Equal(left, right);
             predicate = predicate is null ? equal : Expression.AndAlso(predicate, equal);
         }
-        return await db.Set<T>().FirstOrDefaultAsync(
-            Expression.Lambda<Func<T, bool>>(predicate!, parameter), cancellationToken);
+        if (excludedId is int id)
+        {
+            var rowId = Expression.Call(typeof(EF), nameof(EF.Property),
+                [typeof(int)], parameter, Expression.Constant("Id"));
+            predicate = Expression.AndAlso(predicate!,
+                Expression.NotEqual(rowId, Expression.Constant(id)));
+        }
+        return Expression.Lambda<Func<T, bool>>(predicate!, parameter);
     }
 }

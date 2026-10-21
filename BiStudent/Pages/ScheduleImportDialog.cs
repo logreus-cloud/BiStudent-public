@@ -32,12 +32,12 @@ internal sealed class ScheduleImportDialog : DialogShell
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, preview.Warnings.Count > 0 ? 44 : 0));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
         layout.Controls.Add(Ui.Label($"Начало семестра: {preview.SemesterStart:dd.MM.yyyy}. Найдено групп: {groups.Count}.\n" +
-            "Отметьте группы для импорта. Уже существующие в системе группы отмечены заранее.", 10, Theme.Text), 0, 0);
+            "Отметьте группы для импорта. Изменённые группы будут заменены.", 10, Theme.Text), 0, 0);
         foreach (var group in groups)
         {
             var text = $"{group.Group}   ·   {group.Lessons} {UiFormat.Plural(group.Lessons, "занятие", "занятия", "занятий")}   ·   {group.Sheet}" +
-                (group.Exists ? "   ·   есть в системе" : "");
-            list.Items.Add(text, group.Exists);
+                (group.AlreadyLoaded ? "   ·   уже загружено" : group.Exists ? "   ·   будет заменено" : "");
+            list.Items.Add(text, group.Exists && !group.AlreadyLoaded);
         }
         var listCard = new SmoothPanel { Dock = DockStyle.Fill, Padding = new Padding(12), BackColor = Theme.Surface, Margin = new Padding(0, 4, 0, 4) };
         listCard.Controls.Add(list);
@@ -63,6 +63,9 @@ internal sealed class ScheduleImportDialog : DialogShell
     {
         var selected = list.CheckedIndices.Cast<int>().Select(i => groups[i].Group).ToList();
         if (selected.Count == 0) { error.Text = "Отметьте хотя бы одну группу."; return; }
+        if (list.CheckedIndices.Cast<int>().Any(i => groups[i].Exists && !groups[i].AlreadyLoaded) &&
+            !Ui.Confirm(FindForm(), "Заменить расписание",
+                "Расписание выбранных групп будет заменено новым. Занятия с отметками и оценками сохранятся до последней отмеченной даты. Продолжить?", "Заменить", true)) return;
         busy = true; import.Enabled = false; UseWaitCursor = true; error.Text = "";
         try
         {
@@ -79,15 +82,16 @@ internal sealed class ScheduleImportDialog : DialogShell
         }
     }
 
-    /// Итог импорта: созданные учётные записи с временными паролями (показываются один раз) и пропущенные записи.
+    /// Итог импорта: изменения расписания и созданные учётные записи с временными паролями.
     public static void ShowResult(IWin32Window? owner, ScheduleImportResultDto result)
     {
         using var dialog = new DialogShell("Расписание импортировано", 760, 560);
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Theme.Background };
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, result.Unchanged is { Count: > 0 } ? 82 : 58));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, result.Warnings.Count > 0 ? 110 : 0));
-        layout.Controls.Add(Ui.Label($"Добавлено занятий: {result.Added}, уже были: {result.Skipped}, новых групп: {result.GroupsCreated}.\n" +
+        layout.Controls.Add(Ui.Label($"Добавлено занятий: {result.Added}, обновлено: {result.Updated}, удалено старых: {result.Removed}, новых групп: {result.GroupsCreated}.\n" +
+            (result.Unchanged is { Count: > 0 } ? $"Уже загружено, без изменений: {string.Join(", ", result.Unchanged)}.\n" : "") +
             "Передайте временные пароли преподавателям лично — при первом входе система попросит их сменить.", 10, Theme.Text), 0, 0);
         var grid = Ui.Grid();
         grid.Dock = DockStyle.Fill;

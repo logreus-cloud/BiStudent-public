@@ -5,8 +5,11 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using BiStudent.Contracts;
 using BiStudent.Server.Services;
+using BiStudent.Server.Data;
 using ClosedXML.Excel;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Xunit;
 
@@ -111,7 +114,7 @@ public sealed class ImportTests : IDisposable
     public void Login_IsTransliterated(string name, string login) => Assert.Equal(login, ScheduleImportService.Login(name));
 
     [Fact]
-    public async Task ScheduleImport_CreatesTeachersGroupsAndLessons_Idempotently()
+    public async Task ScheduleImport_CreatesTeachersGroupsAndLessons_RejectsRepeat()
     {
         await AuthenticateAsync("teacher", "teacher123");
         var file = CollegeSchedule();
@@ -130,10 +133,13 @@ public sealed class ImportTests : IDisposable
         var vacancy = Assert.Single(result.Teachers, x => x.FullName == CollegeScheduleParser.Vacancy);
         Assert.True(vacancy is { Active: false, TemporaryPassword: null });
 
-        var again = await PostFileAsync<ScheduleImportResultDto>("/api/schedule/import-xlsx?groups=23-ПО-103-4р-1", file);
-        Assert.Equal(0, again.Added);
-        Assert.Equal(4, again.Skipped);
-        Assert.All(again.Teachers, x => Assert.False(x.Created));
+        var loaded = await PostFileAsync<ScheduleImportPreviewDto>("/api/schedule/import-xlsx/preview", file);
+        Assert.True(Assert.Single(loaded.Groups, x => x.Group == "23-ПО-103-4р-1").AlreadyLoaded);
+        var again = await client.PostAsync("/api/schedule/import-xlsx?groups=23-ПО-103-4р-1", new ByteArrayContent(file));
+        Assert.Equal(HttpStatusCode.BadRequest, again.StatusCode);
+        Assert.Contains("уже загружено", await again.Content.ReadAsStringAsync());
+        using (var scope = factory.Services.CreateScope())
+            Assert.Equal(4, await scope.ServiceProvider.GetRequiredService<AppDbContext>().ScheduleSlots.CountAsync(x => x.Group.Name == "23-ПО-103-4р-1"));
 
         // Новый преподаватель входит временным паролем и видит своё занятие в 6-ю неделю (понедельник 05.10.2026).
         using var teacherClient = factory.CreateClient();
@@ -146,6 +152,65 @@ public sealed class ImportTests : IDisposable
         // Импорт создаёт учётные записи — неадмину запрещён.
         var forbidden = await teacherClient.PostAsync("/api/schedule/import-xlsx?groups=23-ПО-103-4р-1", new ByteArrayContent(file));
         Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
+    }
+
+    [Fact]
+    public async Task ScheduleImport_ReplacesChangedLessonsAndKeepsMatchedId()
+    {
+        await AuthenticateAsync("teacher", "teacher123");
+        var path = "/api/schedule/import-xlsx?groups=23-ПО-103-4р-1";
+        await PostFileAsync<ScheduleImportResultDto>(path, CollegeSchedule());
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var matched = await db.ScheduleSlots.AsNoTracking().SingleAsync(x => x.Subject == "Искусственный интеллект OpenCV");
+        var removed = await db.ScheduleSlots.AsNoTracking().SingleAsync(x => x.Subject == "База данных PL SQL/MONGODB");
+
+        var result = await PostFileAsync<ScheduleImportResultDto>(path, ChangedSchedule());
+
+        Assert.Equal((1, 1, 1), (result.Added, result.Updated, result.Removed));
+        var slots = await db.ScheduleSlots.AsNoTracking().Where(x => x.GroupId == matched.GroupId).ToListAsync();
+        Assert.Equal(4, slots.Count);
+        Assert.Contains(slots, x => x.Id == matched.Id && x.Room == "712" &&
+            x.ValidTo == new DateOnly(2026, 10, 25));
+        Assert.DoesNotContain(slots, x => x.Id == removed.Id);
+        Assert.Single(slots, x => x.Subject == "Новый предмет");
+    }
+
+    [Fact]
+    public async Task ScheduleImport_KeepsAttendanceOnRemovedLesson()
+    {
+        await AuthenticateAsync("teacher", "teacher123");
+        var path = "/api/schedule/import-xlsx?groups=23-ПО-103-4р-1";
+        await PostFileAsync<ScheduleImportResultDto>(path, CollegeSchedule());
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var slot = await db.ScheduleSlots.SingleAsync(x => x.Subject == "База данных PL SQL/MONGODB");
+        var student = new Student { FullName = "Тестовый студент", GroupId = slot.GroupId };
+        db.Students.Add(student);
+        await db.SaveChangesAsync();
+        var date = new DateOnly(2026, 9, 14);
+        db.AttendanceMarks.Add(new AttendanceMark
+        {
+            SlotId = slot.Id, StudentId = student.Id, Date = date,
+            Status = AttendanceStatus.Present, Method = MarkMethod.Manual, MarkedAt = date.ToDateTime(new TimeOnly(9, 0))
+        });
+        await db.SaveChangesAsync();
+
+        await PostFileAsync<ScheduleImportResultDto>(path, ChangedSchedule());
+
+        var archived = await db.ScheduleSlots.AsNoTracking().SingleAsync(x => x.Id == slot.Id);
+        Assert.Equal(date, archived.ValidTo);
+        Assert.Single(await db.AttendanceMarks.AsNoTracking().Where(x => x.SlotId == slot.Id).ToListAsync());
+    }
+
+    private static byte[] ChangedSchedule()
+    {
+        using var workbook = new XLWorkbook(new MemoryStream(CollegeSchedule()));
+        workbook.Worksheet("4 курс").Cell(7, 5).Value =
+            "Искусственный интеллект OpenCV · 712 · нед. 6-8\n[ПРАКТИКА] Новый предмет · 601 · нед. 3 (разово)";
+        using var stream = new MemoryStream();
+        workbook.SaveAs(stream);
+        return stream.ToArray();
     }
 
     [Fact]
