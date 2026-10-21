@@ -56,9 +56,13 @@ public sealed class CloudAccountService(
                         result = await LinkAndAcceptAsync(
                             session, local, password, cancellationToken);
                     }
+                    // Короткий пароль пускаем локально только до обязательной смены (первый вход admin/admin):
+                    // облачная учётка создаётся при смене. Иначе вход остался бы в пустой локальной базе.
                     catch (FirebaseAuthException signup) when (signup.Code == "WEAK_PASSWORD")
                     {
-                        result = LocalResult(local, password);
+                        result = local.MustChangePassword
+                            ? LocalResult(local, password)
+                            : Failure(401, NotInCloud);
                     }
                     catch (FirebaseAuthException signup) when (signup.Code == "EMAIL_EXISTS")
                     {
@@ -71,8 +75,8 @@ public sealed class CloudAccountService(
                     catch (FirebaseAuthException signup)
                     {
                         logger.LogWarning(signup,
-                            "Перенос учётной записи {Login} отложен", login);
-                        result = LocalResult(local, password);
+                            "Перенос учётной записи {Login} не удался", login);
+                        result = Failure(503, "Не удалось подключить учётную запись к облаку: " + signup.Message);
                     }
                 }
             }
@@ -171,8 +175,10 @@ public sealed class CloudAccountService(
         }
         catch (FirebaseAuthException exception) when (exception.Code == "EMAIL_EXISTS")
         {
-            logger.LogWarning(exception,
-                "Перенос учётной записи {Login} отложен: e-mail уже занят", teacher.Login);
+            // Логин уже есть в облаке (новый компьютер): локальная смена пароля отрезала бы этот компьютер от общей базы.
+            throw new InvalidOperationException(
+                $"Учётная запись «{teacher.Login}» уже есть в облаке. Выйдите и войдите её облачным паролем — данные загрузятся из облака.",
+                exception);
         }
     }
 
@@ -438,6 +444,9 @@ public sealed class CloudAccountService(
         logger.LogWarning("Вход {Login} оставлен локальным: {Reason}", local!.Login, reason);
         return new CloudLoginResult(local, 200, null, false);
     }
+
+    private const string NotInCloud =
+        "Неверный логин или пароль. Войдите логином и паролем, которые выдал администратор.";
 
     private CloudLoginResult LocalResult(Teacher? local, string password) =>
         Matches(local, password)

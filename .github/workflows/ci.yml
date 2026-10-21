@@ -88,6 +88,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "v1.0.${{ github.run_number }}" dist/BiStudent-win-x64.zip
-          --target "${{ github.sha }}" --title "BiStudent 1.0.${{ github.run_number }}"
-          --notes "Windows 10/11 x64: скачайте BiStudent-win-x64.zip, распакуйте целиком и запустите BiStudent.exe. Устанавливать ничего не нужно. На новом компьютере вход teacher / teacher123."
+          gh release create "v1.2.${{ github.run_number }}" dist/BiStudent-win-x64.zip
+          --target "${{ github.sha }}" --title "BiStudent 1.2.${{ github.run_number }}"
+          --notes "Windows 10/11 x64: скачайте BiStudent-win-x64.zip, распакуйте целиком и запустите BiStudent.exe. Устанавливать ничего не нужно. Войдите логином и паролем, которые выдал администратор; при первом входе нужен интернет — данные загрузятся из облака."

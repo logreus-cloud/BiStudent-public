@@ -105,6 +105,40 @@ public sealed class FirebaseEmulatorTests : IDisposable
     }
 
     [Fact]
+    public async Task AdministratorOnAnotherComputerUsesCloudAccount()
+    {
+        await ClearAsync();
+        using var first = Factory("a");
+        using var firstClient = first.CreateClient();
+        await BootstrapAsync(firstClient);
+        await PostAsync<GroupDto>(firstClient, "/api/groups", new CreateGroupRequest("Облачная группа"));
+        Assert.Equal("Ok", (await RunAsync(firstClient)).State);
+
+        using var second = Factory("b");
+        using var secondClient = second.CreateClient();
+        // Новый компьютер: admin/admin либо не пускает (эмулятор сразу отвечает EMAIL_EXISTS), либо пускает только
+        // к обязательной смене пароля (Firebase сначала отвечает WEAK_PASSWORD), и смена не отрезает его от облака.
+        var local = await secondClient.PostAsJsonAsync("/api/auth/login", new LoginRequest("admin", "admin"));
+        if (local.StatusCode == HttpStatusCode.OK)
+        {
+            var token = await local.Content.ReadFromJsonAsync<TokenResponse>();
+            Assert.NotNull(token);
+            Authorize(secondClient, token);
+            var changed = await secondClient.PostAsJsonAsync("/api/auth/change-password",
+                new ChangePasswordRequest("admin", "Other-pass-1"));
+            Assert.Equal(HttpStatusCode.BadRequest, changed.StatusCode);
+            secondClient.DefaultRequestHeaders.Authorization = null;
+        }
+        else Assert.Equal(HttpStatusCode.Unauthorized, local.StatusCode);
+
+        Authorize(secondClient, await LoginAsync(secondClient, "admin", "Admin-pass-1"));
+        Assert.Equal("Ok", (await RunAsync(secondClient)).State);
+        using var scope = second.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.True(await db.Groups.AnyAsync(candidate => candidate.Name == "Облачная группа"));
+    }
+
+    [Fact]
     public async Task OfflineLoginUsesLocalPasswordCache()
     {
         await ClearAsync();
