@@ -64,6 +64,9 @@ public sealed class ApiEndpointsTests : IDisposable
         Assert.True(page.Headers.Contains("Content-Security-Policy"));
         Assert.Equal("nosniff", page.Headers.GetValues("X-Content-Type-Options").Single());
         Assert.Equal("no-referrer", page.Headers.GetValues("Referrer-Policy").Single());
+        var script = await client.GetAsync("/register/register.js");
+        Assert.Equal(HttpStatusCode.OK, script.StatusCode);
+        Assert.True(script.Headers.CacheControl?.NoCache);
     }
 
     [Fact]

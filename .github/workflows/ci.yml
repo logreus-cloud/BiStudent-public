@@ -51,7 +51,7 @@ jobs:
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
         run: >
           npx --yes firebase-tools@14 emulators:exec --only auth,firestore --project demo-bistudent
-          "dotnet test BiStudent.Tests -- --filter-class BiStudent.Tests.FirebaseEmulatorTests --filter-class BiStudent.Tests.FirebaseSyncScenarioTests"
+          "dotnet test BiStudent.Tests -- --filter-class BiStudent.Tests.FirebaseEmulatorTests --filter-class BiStudent.Tests.FirebaseSyncScenarioTests --filter-class BiStudent.Tests.FirebaseDeferredSignInTests"
 
   docker:
     runs-on: ubuntu-24.04

@@ -6,6 +6,7 @@ namespace BiStudent.Server.Sync;
 
 public sealed class SyncWorker(
     SyncService sync, SyncSignal signal, BackupService backup,
+    PendingCloudSignIn pending, IServiceScopeFactory scopes,
     IOptions<FirebaseOptions> options, ILogger<SyncWorker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -26,7 +27,27 @@ public sealed class SyncWorker(
             {
                 if (backup.TryEnterRequest())
                 {
-                    try { await sync.RunAsync(stoppingToken); }
+                    try
+                    {
+                        if (pending.TryGet(out _, out _))
+                        {
+                            try
+                            {
+                                using var scope = scopes.CreateScope();
+                                await scope.ServiceProvider.GetRequiredService<CloudAccountService>()
+                                    .TryCompleteDeferredSignInAsync(stoppingToken);
+                            }
+                            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                            {
+                                throw;
+                            }
+                            catch (Exception exception)
+                            {
+                                logger.LogWarning(exception, "Ошибка отложенного облачного входа");
+                            }
+                        }
+                        await sync.RunAsync(stoppingToken);
+                    }
                     finally { backup.ExitRequest(); }
                 }
             }
@@ -41,8 +62,12 @@ public sealed class SyncWorker(
 
             try
             {
+                var interval = pending.TryGet(out _, out _) ||
+                    sync.Status.State is SyncState.Offline or SyncState.Error
+                    ? Math.Min(options.Value.SyncIntervalSeconds, 20)
+                    : options.Value.SyncIntervalSeconds;
                 await signal.WaitAsync(
-                    TimeSpan.FromSeconds(options.Value.SyncIntervalSeconds), stoppingToken);
+                    TimeSpan.FromSeconds(interval), stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {

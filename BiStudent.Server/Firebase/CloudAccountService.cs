@@ -11,7 +11,7 @@ public sealed record CloudLoginResult(Teacher? Teacher, int Status, string? Erro
 public sealed class CloudAccountService(
     AppDbContext db, IPasswordHasher<Teacher> hasher, FirebaseAuthClient auth,
     FirestoreClient firestore, FirebaseSessionStore sessions, SyncService sync,
-    SyncSignal signal, IOptions<FirebaseOptions> options, ILogger<CloudAccountService> logger)
+    SyncSignal signal, PendingCloudSignIn pending, IOptions<FirebaseOptions> options, ILogger<CloudAccountService> logger)
 {
     private static readonly SemaphoreSlim loginGate = new(1, 1);
     private readonly FirebaseOptions settings = options.Value;
@@ -33,6 +33,7 @@ public sealed class CloudAccountService(
         var local = await db.Teachers.SingleOrDefaultAsync(
             teacher => teacher.Login.ToLower() == lower, cancellationToken);
         CloudLoginResult result;
+        var unavailableFallback = false;
         if (!Enabled)
             result = LocalResult(local, password);
         else
@@ -70,6 +71,7 @@ public sealed class CloudAccountService(
                     }
                     catch (FirebaseUnavailableException)
                     {
+                        unavailableFallback = true;
                         result = LocalResult(local, password);
                     }
                     catch (FirebaseAuthException signup)
@@ -95,6 +97,7 @@ public sealed class CloudAccountService(
             }
             catch (FirebaseUnavailableException)
             {
+                unavailableFallback = true;
                 result = LocalResult(local, password);
             }
         }
@@ -109,7 +112,75 @@ public sealed class CloudAccountService(
             teacher.PasswordHash = hasher.HashPassword(teacher, password);
         teacher.LastLoginAt = DateTime.Now;
         await db.SaveChangesAsync(cancellationToken);
+        // Только для учёток, уже привязанных к облаку: их повторный вход не меняет UID и SecurityStamp,
+        // поэтому выданные сейчас локальные токены остаются действительными.
+        if (unavailableFallback && teacher.FirebaseUid is not null) pending.Remember(login, password);
         return result;
+    }
+
+    public async Task<bool> TryCompleteDeferredSignInAsync(CancellationToken cancellationToken)
+    {
+        if (!pending.TryGet(out _, out _) || sessions.Uid is not null) return false;
+        await loginGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!pending.TryGet(out var login, out var password) || sessions.Uid is not null)
+                return false;
+            var lower = login.Trim().ToLowerInvariant();
+            var local = await db.Teachers.SingleOrDefaultAsync(
+                teacher => teacher.Login.ToLower() == lower, cancellationToken);
+            if (local is not { IsActive: true, FirebaseUid: not null } || !Matches(local, password))
+            {
+                pending.Clear();
+                logger.LogWarning("Отложенный облачный вход отклонён: локальная учётная запись изменилась");
+                return false;
+            }
+            var uid = local.FirebaseUid;
+            try
+            {
+                var session = await auth.SignInAsync(
+                    settings.EmailFor(login), password, cancellationToken);
+                // Другой UID означал бы перепривязку и смену SecurityStamp — это делает только обычный вход.
+                if (session.Uid != uid)
+                {
+                    pending.Clear();
+                    logger.LogWarning("Отложенный облачный вход отклонён: учётная запись в облаке другая");
+                    return false;
+                }
+                // Для привязанной учётки идёт ветка TeacherUids: UID не меняется, stamp меняет только
+                // синхронизация облачных изменений (например, отзыв прав) — так и должно быть.
+                var result = await LinkAndAcceptAsync(session, local, password, cancellationToken);
+                if (!result.Online || result.Teacher is null)
+                {
+                    pending.Clear();
+                    logger.LogWarning("Отложенный облачный вход отклонён: {Status}", result.Status);
+                    return false;
+                }
+                // Синхронизация могла перезаписать локальную запись — сохраняем хеш, чтобы вход без связи работал дальше.
+                if (!Matches(result.Teacher, password))
+                {
+                    result.Teacher.PasswordHash = hasher.HashPassword(result.Teacher, password);
+                    await db.SaveChangesAsync(cancellationToken);
+                }
+                pending.Clear();
+                signal.Notify();
+                logger.LogInformation("Облачный вход выполнен после восстановления связи");
+                return true;
+            }
+            catch (FirebaseUnavailableException) { return false; }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                pending.Clear();
+                logger.LogWarning("Отложенный облачный вход не удался: {Reason}",
+                    exception.GetType().Name);
+                return false;
+            }
+        }
+        finally { loginGate.Release(); }
     }
 
     public async Task ChangePasswordAsync(
@@ -413,12 +484,6 @@ public sealed class CloudAccountService(
         {
             return Unlinked(local, password, exception.Message);
         }
-        catch (FirebaseUnavailableException)
-        {
-            return Matches(local, password)
-                ? new CloudLoginResult(local, 200, null, false)
-                : Failure(503, "Нет связи с Firebase, а на этом компьютере вы ещё не входили.");
-        }
     }
 
     private void AcceptSession(FirebaseSession session, int teacherId)
@@ -427,6 +492,7 @@ public sealed class CloudAccountService(
         sessions.Set(session, teacherId);
         if (previousUid != session.Uid)
             sync.Reset();
+        pending.Clear();
     }
 
     private static void SetFirebaseUid(Teacher teacher, string? uid)

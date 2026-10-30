@@ -48,6 +48,7 @@ builder.Services.AddHttpClient<FirebaseAuthClient>();
 builder.Services.AddHttpClient<FirestoreClient>();
 builder.Services.AddSingleton<FirebaseSessionStore>();
 builder.Services.AddSingleton<SyncService>();
+builder.Services.AddSingleton<PendingCloudSignIn>();
 builder.Services.AddScoped<CloudAccountService>();
 builder.Services.AddHostedService<SyncWorker>();
 builder.Services.AddHealthChecks().AddDbContextCheck<AppDbContext>();
@@ -164,6 +165,8 @@ app.Use(async (context, next) =>
         context.Response.Headers["Content-Security-Policy"] =
             "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'";
         context.Response.Headers["Permissions-Policy"] = "camera=(self)";
+        // После обновления сервера браузер иначе берёт старый register.js из кеша к новой разметке.
+        context.Response.Headers.CacheControl = "no-cache";
     }
     await next();
 });
