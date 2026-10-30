@@ -45,7 +45,9 @@ internal static class AppUpdater
         return result.State == UpdateCheckState.Available ? result.Version : null;
     }
 
-    public static async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken)
+    /// progress получает версию и процент загрузки (0–100), пока скачивается обновление.
+    public static async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken,
+        IProgress<(string Version, int Percent)>? progress = null)
     {
         try
         {
@@ -59,7 +61,11 @@ internal static class AppUpdater
                     return new(UpdateCheckState.Available, existing.TargetFullRelease.Version.ToString(), null);
                 var info = await updater.CheckForUpdatesAsync().ConfigureAwait(false);
                 if (info is null) return new(UpdateCheckState.UpToDate, null, null);
-                await updater.DownloadUpdatesAsync(info, cancelToken: cancellationToken).ConfigureAwait(false);
+                var version = info.TargetFullRelease.Version.ToString();
+                progress?.Report((version, 0));
+                await updater.DownloadUpdatesAsync(info,
+                    percent => progress?.Report((version, Math.Clamp(percent, 0, 100))),
+                    cancelToken: cancellationToken).ConfigureAwait(false);
                 downloaded = info;
                 return new(UpdateCheckState.Available, info.TargetFullRelease.Version.ToString(), null);
             }

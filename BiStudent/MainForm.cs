@@ -185,7 +185,14 @@ internal sealed class MainForm : DarkForm
         try
         {
             var cancellationToken = updateCancellation.Token;
-            var result = await Task.Run(() => AppUpdater.CheckAsync(cancellationToken));
+            // Progress создаётся в потоке окна и сам переносит отчёты в него.
+            var progress = new Progress<(string Version, int Percent)>(report =>
+            {
+                if (IsDisposed || updateCancellation.IsCancellationRequested) return;
+                updateStatus.Text = $"⬇ Загрузка обновления {report.Version} — {report.Percent}%";
+                updateStatus.ForeColor = Theme.Muted;
+            });
+            var result = await Task.Run(() => AppUpdater.CheckAsync(cancellationToken, progress));
             if (updateCancellation.IsCancellationRequested || IsDisposed) return;
             updateCheckState = result.State;
             updateVersion = result.State == UpdateCheckState.Available ? result.Version : null;
