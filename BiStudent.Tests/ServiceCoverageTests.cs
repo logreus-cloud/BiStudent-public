@@ -47,7 +47,7 @@ public sealed class ServiceCoverageTests
         Assert.Equal(2, (await test.Schedule.ForWeekAsync(teacher.Id, new DateOnly(2026, 8, 31))).Count);
 
         var overlap = test.NewSlot(teacher, group, start: new TimeOnly(9, 30), end: new TimeOnly(10, 30));
-        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => test.Schedule.AddSlotAsync(overlap));
+        var error = await Assert.ThrowsAsync<ScheduleConflictException>(() => test.Schedule.AddSlotAsync(overlap));
         Assert.Contains("уже есть пара", error.Message);
     }
 

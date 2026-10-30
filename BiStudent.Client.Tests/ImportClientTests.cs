@@ -32,6 +32,31 @@ public sealed class ImportClientTests
     }
 
     [Fact]
+    public async Task ImportScheduleXlsxSendsSelectedTeacher()
+    {
+        var server = new FakeServer();
+        server.On(HttpMethod.Post, "api/schedule/import-xlsx", _ => FakeServer.Json(new ScheduleImportResultDto(1, 0, 0, [], [])));
+        using var api = new ApiClient(new ClientSettings { ServerUrl = "http://test/" }, server);
+
+        await api.ImportScheduleXlsxAsync([1, 2, 3], ["23-ПО-103-4р-1"], 42);
+
+        Assert.Equal("api/schedule/import-xlsx?groups=" + Uri.EscapeDataString("23-ПО-103-4р-1") + "&teacherId=42",
+            Assert.Single(server.Requests).Path);
+    }
+
+    [Fact]
+    public async Task PreviewScheduleXlsxSendsSelectedTeacher()
+    {
+        var server = new FakeServer();
+        server.On(HttpMethod.Post, "api/schedule/import-xlsx/preview", _ => FakeServer.Json(Preview));
+        using var api = new ApiClient(new ClientSettings { ServerUrl = "http://test/" }, server);
+
+        await api.PreviewScheduleXlsxAsync([1, 2, 3], 42);
+
+        Assert.Equal("api/schedule/import-xlsx/preview?teacherId=42", Assert.Single(server.Requests).Path);
+    }
+
+    [Fact]
     public void ScheduleImportDialogShowsPreview()
     {
         ExceptionDispatchInfo? failure = null;
@@ -40,7 +65,7 @@ public sealed class ImportClientTests
             try
             {
                 using var api = new ApiClient(new ClientSettings { ServerUrl = "http://test/" }, new FakeServer());
-                using var dialog = new ScheduleImportDialog(api, [1, 2, 3], Preview);
+                using var dialog = new ScheduleImportDialog(api, [1, 2, 3], Preview, []);
                 dialog.CreateControl();
                 Assert.Null(dialog.Result);
             }

@@ -333,11 +333,25 @@ internal sealed class CameraPage : Page
         var noFrameSince = DateTime.UtcNow;
         var lastRequest = DateTime.MinValue;
         var firstFrame = true;
+        string? iriunHint = null;
+        var hintCheckedAt = DateTime.MinValue;
         try
         {
             while (!token.IsCancellationRequested)
             {
                 var now = DateTime.UtcNow;
+                if ((now - hintCheckedAt).TotalSeconds >= 2)
+                {
+                    hintCheckedAt = now;
+                    var hint = CameraDevices.IriunHint(device);
+                    if (hint != iriunHint)
+                    {
+                        iriunHint = hint;
+                        var restored = capture is not null && !firstFrame;
+                        if (hint is not null) PostUi(() => indicator.Text = hint);
+                        else if (restored) PostUi(() => indicator.Text = "● ищу лица");
+                    }
+                }
                 if (capture is null && now >= nextRetry)
                 {
                     try
@@ -353,7 +367,8 @@ internal sealed class CameraPage : Page
                         capture?.Dispose();
                         capture = null;
                         nextRetry = DateTime.UtcNow.AddSeconds(2);
-                        PostUi(() => indicator.Text = $"Камера недоступна: {ex.Message}. Повтор через 2 с…");
+                        var text = iriunHint ?? $"Камера недоступна: {ex.Message}. Повтор через 2 с…";
+                        PostUi(() => indicator.Text = text);
                     }
                 }
                 if (capture is not null)
@@ -367,7 +382,8 @@ internal sealed class CameraPage : Page
                             if (firstFrame)
                             {
                                 firstFrame = false;
-                                PostUi(() => indicator.Text = "● ищу лица");
+                                var text = iriunHint ?? "● ищу лица";
+                                PostUi(() => indicator.Text = text);
                             }
                             if (Interlocked.CompareExchange(ref pendingFrame, 1, 0) == 0)
                             {
@@ -410,7 +426,8 @@ internal sealed class CameraPage : Page
                             capture.Dispose();
                             capture = null;
                             nextRetry = DateTime.UtcNow.AddSeconds(2);
-                            PostUi(() => indicator.Text = "Нет кадров с камеры — переподключение…");
+                            var text = iriunHint ?? "Нет кадров с камеры — переподключение…";
+                            PostUi(() => indicator.Text = text);
                         }
                     }
                     catch (Exception ex) when (!token.IsCancellationRequested)

@@ -167,12 +167,51 @@ internal sealed class SlotDialog : DarkForm
                 string.IsNullOrWhiteSpace(room.Text) ? null : room.Text.Trim(), oneOff.Checked ? date.Value.DayOfWeek : selectedDay,
                 from, to, oneOff.Checked ? WeekParity.Every : parity.SelectedIndex switch { 1 => WeekParity.Odd, 2 => WeekParity.Even, _ => WeekParity.Every },
                 oneOff.Checked ? DateOnly.FromDateTime(date.Value) : null);
-            await api.SaveSlotAsync(slot?.Id, request);
+            try { await api.SaveSlotAsync(slot?.Id, request); }
+            catch (ApiException ex) when (ex.Conflict is { } conflict)
+            {
+                if (IsDisposed || Disposing) return;
+                if (!ConfirmReplacement(conflict, request)) return;
+                await api.SaveSlotAsync(slot?.Id, request with { ReplaceSlotIds = conflict.Conflicts.Select(x => x.Id).ToList() });
+            }
             if (IsDisposed) return;
             DialogResult = DialogResult.OK; Close();
         }
         catch (ApiException ex) { if (!IsDisposed) error.Text = ex.Message; }
         finally { loading = false; if (!IsDisposed) { save.Enabled = true; UseWaitCursor = false; } }
+    }
+
+    private bool ConfirmReplacement(ScheduleConflictDto conflict, SaveSlotRequest request)
+    {
+        using var dialog = new DialogShell("Время занято", 760, 480);
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Theme.Background };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
+        layout.Controls.Add(Ui.Label(conflict.Message, 9.5f, Theme.Text), 0, 0);
+        var grid = Ui.Grid();
+        grid.Dock = DockStyle.Fill;
+        grid.Columns.Add("group", "Группа");
+        grid.Columns.Add("subject", "Предмет");
+        grid.Columns.Add("day", "День / дата");
+        grid.Columns.Add("time", "Время");
+        grid.Columns.Add("room", "Аудитория");
+        foreach (var item in conflict.Conflicts)
+            grid.Rows.Add(item.GroupName, item.Subject,
+                item.OneOffDate is DateOnly date ? UiFormat.Date(date) : UiFormat.DayLong(item.DayOfWeek),
+                $"{item.Start:HH:mm}–{item.End:HH:mm}", item.Room ?? "—");
+        layout.Controls.Add(grid, 0, 1);
+        var today = DateOnly.FromDateTime(DateTime.Today);
+        var actions = conflict.Conflicts.Select(item =>
+            item.OneOffDate is not null ? "Разовая пара удалится." :
+            request.OneOffDate is not null ? "Занятие этой даты отменится." :
+            item.ValidFrom < today ? "Старая регулярная пара закончится вчера, новая начнётся с сегодня." :
+                "Старая регулярная пара удалится, новая начнётся с сегодня.").Distinct();
+        layout.Controls.Add(Ui.Label(string.Join(" ", actions), 9, Theme.Muted), 0, 2);
+        dialog.Content.Controls.Add(layout);
+        dialog.AddButton("Отмена", DialogResult.Cancel);
+        dialog.AddButton("Заменить", DialogResult.OK, true);
+        return dialog.ShowDialog(this) == DialogResult.OK;
     }
 
     private sealed record GroupChoice(int Id, string Name)

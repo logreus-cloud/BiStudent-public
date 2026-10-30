@@ -150,7 +150,8 @@ internal sealed class SchedulePage : Page
         using var guide = new DialogShell("Импорт расписания", 720, 280);
         var explanation = Ui.Label(
             "Excel — расписание колледжа на семестр (блоки «день · звонок · пара · аудитория · группа»). " +
-            "Вы выберете группы, а учётные записи преподавателей создадутся автоматически (нужны права администратора).\n\n" +
+            "Преподаватель импортирует расписание на себя. Администратор может назначить его любому преподавателю " +
+            "или использовать ФИО из файла с созданием учётных записей.\n\n" +
             "CSV: День;Начало;Конец;Предмет;Группа;Аудитория;Неделя — одна строка на шаблон пары.", 10, Theme.Text);
         explanation.TextAlign = ContentAlignment.TopLeft;
         guide.Content.Controls.Add(explanation);
@@ -203,10 +204,20 @@ internal sealed class SchedulePage : Page
             if (!IsDisposed) Ui.Toast(this, $"Не удалось прочитать файл: {ex.Message}", true);
             return;
         }
-        var preview = await Api.PreviewScheduleXlsxAsync(file);
+        var self = Api.Teacher is { IsAdmin: false } teacher ? teacher : null;
+        var preview = await Api.PreviewScheduleXlsxAsync(file, self?.Id);
         if (IsDisposed) return;
         if (preview.Groups.Count == 0) { Ui.Message(FindForm(), "Импорт расписания", "В файле не найдено групп в формате расписания колледжа."); return; }
-        using var dialog = new ScheduleImportDialog(Api, file, preview);
+        List<TeacherAccountDto> teachers = [];
+        if (self is null)
+        {
+            try { teachers = await Api.TeachersAsync(); }
+            catch (ApiException) { teachers = []; }
+            if (preview.FileTeacherId is int id && teachers.Any(x => x.Id == id))
+                preview = await Api.PreviewScheduleXlsxAsync(file, id);
+        }
+        if (IsDisposed) return;
+        using var dialog = new ScheduleImportDialog(Api, file, preview, teachers, self);
         if (dialog.ShowDialog(FindForm()) != DialogResult.OK || dialog.Result is not { } result) return;
         ScheduleImportDialog.ShowResult(FindForm(), result);
         await RefreshAsync();

@@ -54,12 +54,13 @@ public static class ApiEndpoints
             await service.RestoreAsync(id, request.Date);
             return Results.NoContent();
         });
-        // Расписание колледжа из Excel: предпросмотр доступен всем, импорт создаёт учётные записи — только администратору.
-        schedule.MapPost("/import-xlsx/preview", async (HttpRequest request, ScheduleImportService import) =>
-            await import.PreviewAsync(await BufferAsync(request))).WithMetadata(new RequestSizeLimitAttribute(20 * 1024 * 1024));
-        schedule.MapPost("/import-xlsx", async (HttpRequest request, [FromQuery] string[]? groups, ScheduleImportService import) =>
-            await import.ImportAsync(await BufferAsync(request), groups ?? []))
-            .RequireAuthorization("Admin").WithMetadata(new RequestSizeLimitAttribute(20 * 1024 * 1024));
+        // Преподаватель импортирует расписание на себя, администратор может выбрать преподавателя или имена из файла.
+        schedule.MapPost("/import-xlsx/preview", async (HttpRequest request, [FromQuery] int? teacherId, ClaimsPrincipal user, ScheduleImportService import) =>
+            await import.PreviewAsync(await BufferAsync(request), ImportTeacherId(user, teacherId)))
+            .WithMetadata(new RequestSizeLimitAttribute(20 * 1024 * 1024));
+        schedule.MapPost("/import-xlsx", async (HttpRequest request, [FromQuery] string[]? groups, [FromQuery] int? teacherId, ClaimsPrincipal user, ScheduleImportService import) =>
+            await import.ImportAsync(await BufferAsync(request), groups ?? [], ImportTeacherId(user, teacherId)))
+            .WithMetadata(new RequestSizeLimitAttribute(20 * 1024 * 1024));
         schedule.MapPost("/import", async (HttpRequest request, ClaimsPrincipal user, ScheduleService service) =>
         {
             using var body = new MemoryStream();
@@ -217,6 +218,21 @@ public static class ApiEndpoints
     {
         try { return await next(context); }
         catch (DbUpdateException ex) when (ex.InnerException is SqliteException { SqliteErrorCode: 19 }) { return Results.Json(new ErrorDto("Данные одновременно изменил другой запрос — обновите и повторите."), statusCode: StatusCodes.Status409Conflict); }
+        catch (ScheduleConflictException ex)
+        {
+            var db = context.HttpContext.RequestServices.GetRequiredService<AppDbContext>();
+            var groupIds = ex.Conflicts.Select(x => x.GroupId).Distinct().ToArray();
+            var names = await db.Groups.AsNoTracking().Where(x => groupIds.Contains(x.Id))
+                .ToDictionaryAsync(x => x.Id, x => x.Name);
+            var conflicts = ex.Conflicts.Select(x => Map(x, names[x.GroupId])).ToList();
+            var first = conflicts[0];
+            var when = first.OneOffDate?.ToString("dd.MM.yyyy", CultureInfo.InvariantCulture)
+                ?? CultureInfo.GetCultureInfo("ru-RU").DateTimeFormat.GetDayName(first.DayOfWeek);
+            var message = $"У вас уже есть пара в это время: {first.GroupName}, {first.Subject}, {when} {first.Start:HH:mm}–{first.End:HH:mm}" +
+                (string.IsNullOrWhiteSpace(first.Room) ? "" : $", ауд. {first.Room}") +
+                (conflicts.Count > 1 ? $"; и ещё {conflicts.Count - 1}" : "");
+            return Results.Json(new ScheduleConflictDto(message, conflicts), statusCode: StatusCodes.Status409Conflict);
+        }
         catch (InvalidOperationException ex) { return Results.Json(new ErrorDto(ex.Message), statusCode: StatusCodes.Status400BadRequest); }
         catch (KeyNotFoundException ex) { return Results.Json(new ErrorDto(ex.Message), statusCode: StatusCodes.Status404NotFound); }
         catch (UnauthorizedAccessException ex) { return Results.Json(new ErrorDto(ex.Message), statusCode: StatusCodes.Status403Forbidden); }
@@ -233,6 +249,10 @@ public static class ApiEndpoints
         if (!await db.ScheduleSlots.AnyAsync(x => x.Id == slotId && x.TeacherId == teacherId))
             throw new KeyNotFoundException("Пара не найдена в вашем расписании.");
     }
+
+    private static int? ImportTeacherId(ClaimsPrincipal user, int? teacherId) =>
+        user.HasClaim("bistudent:admin", "true") ? teacherId :
+        teacherId is int id && id != TeacherId(user) ? throw new UnauthorizedAccessException("Назначать расписание другому преподавателю может только администратор.") : TeacherId(user);
 
     internal static async Task EnsureLessonAsync(ScheduleService schedule, int slotId, DateOnly date,
         bool skipFuture = false, bool allowMissing = false)
@@ -263,6 +283,7 @@ public static class ApiEndpoints
     {
         var teacherId = TeacherId(user);
         if (string.IsNullOrWhiteSpace(request.Subject)) throw new InvalidOperationException("Укажите предмет.");
+        await using var transaction = await db.Database.BeginTransactionAsync();
         var groupId = request.GroupId;
         if (!string.IsNullOrWhiteSpace(request.NewGroupName)) groupId = (await students.AddGroupAsync(request.NewGroupName)).Id;
         if (!await db.Groups.AnyAsync(x => x.Id == groupId)) throw new InvalidOperationException("Выберите группу.");
@@ -278,9 +299,12 @@ public static class ApiEndpoints
             ValidFrom = request.OneOffDate ?? (existing?.OneOffDate is not null ? semester : existing?.ValidFrom ?? semester),
             ValidTo = request.OneOffDate ?? (existing?.OneOffDate is not null ? null : existing?.ValidTo), OneOffDate = request.OneOffDate
         };
-        if (existing is null) slot = await service.AddSlotAsync(slot);
+        if (request.ReplaceSlotIds is { } replace)
+            slot = await service.ReplaceAndSaveAsync(slot, replace, existing is not null);
+        else if (existing is null) slot = await service.AddSlotAsync(slot);
         else await service.UpdateSlotAsync(slot);
         var group = await db.Groups.AsNoTracking().SingleAsync(x => x.Id == slot.GroupId);
+        await transaction.CommitAsync();
         return Results.Ok(Map(slot, group.Name));
     }
 

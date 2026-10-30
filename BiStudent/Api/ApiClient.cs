@@ -11,10 +11,12 @@ namespace BiStudent;
 internal sealed class ApiException : Exception
 {
     public HttpStatusCode? StatusCode { get; }
+    public ScheduleConflictDto? Conflict { get; }
 
-    public ApiException(HttpStatusCode? statusCode, string message, Exception? inner = null) : base(message, inner)
+    public ApiException(HttpStatusCode? statusCode, string message, Exception? inner = null, ScheduleConflictDto? conflict = null) : base(message, inner)
     {
         StatusCode = statusCode;
+        Conflict = conflict;
     }
 }
 
@@ -170,11 +172,13 @@ internal sealed class ApiClient : IDisposable
     // Файл списка как есть: CSV или журнал Excel (.xlsx), формат сервер определяет сам.
     public Task<ImportResultDto> ImportStudentsAsync(byte[] file) =>
         RequestAsync<ImportResultDto>(HttpMethod.Post, "api/students/import", Binary(file), timeout: LongTimeout);
-    public Task<ScheduleImportPreviewDto> PreviewScheduleXlsxAsync(byte[] xlsx) =>
-        RequestAsync<ScheduleImportPreviewDto>(HttpMethod.Post, "api/schedule/import-xlsx/preview", Binary(xlsx), timeout: LongTimeout);
-    public Task<ScheduleImportResultDto> ImportScheduleXlsxAsync(byte[] xlsx, IEnumerable<string> groups) =>
+    public Task<ScheduleImportPreviewDto> PreviewScheduleXlsxAsync(byte[] xlsx, int? teacherId = null) =>
+        RequestAsync<ScheduleImportPreviewDto>(HttpMethod.Post, "api/schedule/import-xlsx/preview" +
+            (teacherId is int id ? "?teacherId=" + id.ToString(CultureInfo.InvariantCulture) : ""), Binary(xlsx), timeout: LongTimeout);
+    public Task<ScheduleImportResultDto> ImportScheduleXlsxAsync(byte[] xlsx, IEnumerable<string> groups, int? teacherId = null) =>
         RequestAsync<ScheduleImportResultDto>(HttpMethod.Post,
-            "api/schedule/import-xlsx?" + string.Join("&", groups.Select(g => "groups=" + Uri.EscapeDataString(g))), Binary(xlsx), timeout: LongTimeout);
+            "api/schedule/import-xlsx?" + string.Join("&", groups.Select(g => "groups=" + Uri.EscapeDataString(g))) +
+            (teacherId is int id ? "&teacherId=" + id.ToString(CultureInfo.InvariantCulture) : ""), Binary(xlsx), timeout: LongTimeout);
 
     private static ByteArrayContent Binary(byte[] bytes)
     {
@@ -345,7 +349,7 @@ internal sealed class ApiClient : IDisposable
             }
             using (response)
             {
-                throw new ApiException(response.StatusCode, await ErrorMessageAsync(response, cancellationToken));
+                throw await ResponseErrorAsync(response, cancellationToken);
             }
         }
         catch (Exception ex) when (ex is HttpRequestException or IOException) { throw NetworkError(ex); }
@@ -452,20 +456,29 @@ internal sealed class ApiClient : IDisposable
         }
     }
 
-    private static async Task<string> ErrorMessageAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    private static async Task<ApiException> ResponseErrorAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         var body = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
         if (!string.IsNullOrEmpty(body))
         {
             try
             {
+                if (response.StatusCode == HttpStatusCode.Conflict)
+                {
+                    using var json = JsonDocument.Parse(body);
+                    if (json.RootElement.TryGetProperty("conflicts", out _))
+                    {
+                        var conflict = JsonSerializer.Deserialize<ScheduleConflictDto>(body, JsonOptions);
+                        if (conflict is not null) return new ApiException(response.StatusCode, conflict.Message, conflict: conflict);
+                    }
+                }
                 var error = JsonSerializer.Deserialize<ErrorDto>(body, JsonOptions);
-                if (!string.IsNullOrWhiteSpace(error?.Message)) return error.Message;
+                if (!string.IsNullOrWhiteSpace(error?.Message)) return new ApiException(response.StatusCode, error.Message);
             }
             catch (JsonException) { }
-            return body;
+            return new ApiException(response.StatusCode, body);
         }
-        return $"Ошибка сервера ({(int)response.StatusCode}).";
+        return new ApiException(response.StatusCode, $"Ошибка сервера ({(int)response.StatusCode}).");
     }
 
     private ApiException NetworkError(Exception ex) =>

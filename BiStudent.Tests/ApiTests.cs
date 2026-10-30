@@ -57,7 +57,7 @@ public sealed class ApiTests : IDisposable
     }
 
     [Fact]
-    public async Task AddSlot_WithOverlapReturnsBadRequestAndMessage()
+    public async Task AddSlot_WithOverlapReturnsConflictWithSlots()
     {
         await AuthenticateAsync();
         var lessons = await client.GetFromJsonAsync<List<LessonDto>>("/api/schedule/day?date=2026-09-01", JsonOptions);
@@ -67,10 +67,11 @@ public sealed class ApiTests : IDisposable
         var request = new SaveSlotRequest(slot.GroupId, null, "Конфликт", null,
             slot.DayOfWeek, slot.Start, slot.End, slot.Parity, null);
         var response = await client.PostAsJsonAsync("/api/schedule/slots", request, JsonOptions);
-        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        var error = await response.Content.ReadFromJsonAsync<ErrorDto>(JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var error = await response.Content.ReadFromJsonAsync<ScheduleConflictDto>(JsonOptions);
         Assert.NotNull(error);
         Assert.Contains("уже есть пара", error.Message);
+        Assert.Contains(error.Conflicts, x => x.Id == slot.Id);
     }
 
     [Fact]

@@ -90,10 +90,42 @@ public sealed class ImportTests : IDisposable
         Assert.Contains("Непонятная запись", parsed.Warnings[0]);
     }
 
+    [Fact]
+    public void Parser_FindsFileTeacherAndWarnsAboutDifferentSheets()
+    {
+        using var stream = new MemoryStream(WithFileTeacher("Преподаватель: Ниязова М.Е.   ·   пометка"));
+        var parsed = CollegeScheduleParser.Parse(stream, new DateOnly(2026, 9, 1));
+        Assert.Equal("Ниязова М.Е.", parsed.FileTeacher);
+
+        using var workbook = new XLWorkbook(new MemoryStream(WithFileTeacher("Преподаватель: Ниязова М.Е.")));
+        workbook.Worksheets.Add("5 курс").Cell(5, 1).Value = "Преподаватель: Хамит А.Ү.";
+        using var conflicting = new MemoryStream();
+        workbook.SaveAs(conflicting);
+        conflicting.Position = 0;
+        var conflict = CollegeScheduleParser.Parse(conflicting, new DateOnly(2026, 9, 1));
+        Assert.Null(conflict.FileTeacher);
+        Assert.Contains("В файле указаны разные преподаватели: Ниязова М.Е., Хамит А.Ү.", conflict.Warnings);
+    }
+
+    [Fact]
+    public void Parser_KeepsTeacherLinesTogether()
+    {
+        using var workbook = new XLWorkbook(new MemoryStream(CollegeSchedule()));
+        workbook.Worksheet("4 курс").Cell(8, 5).Value = "Ниязова М.Е. · 506  Тайгара А-510\nХамит А.Ү. · уточнить";
+        using var stream = new MemoryStream();
+        workbook.SaveAs(stream);
+        stream.Position = 0;
+        var parsed = CollegeScheduleParser.Parse(stream, new DateOnly(2026, 9, 1));
+        Assert.Contains(parsed.Lessons, x => x is { Subject: "Искусственный интеллект OpenCV", Teacher: "Ниязова М.Е." });
+        Assert.Contains(parsed.Lessons, x => x is { Subject: "База данных PL SQL/MONGODB", Teacher: "Хамит А.Ү." });
+        Assert.DoesNotContain(parsed.Lessons, x => x.Teacher.Contains("Тайгара"));
+    }
+
     [Theory]
     [InlineData("[ПРАКТИКА] Программирование С# · 505 · нед.5,6,7", "Программирование С#", "505", "5-5,6-6,7-7")]
     [InlineData("[ПРАКТИКА] Программирование С# -нед.5-7", "Программирование С#", null, "5-7")]
     [InlineData("[ПРАКТИКА] Программирование С# -5-7", "Программирование С#", null, "5-7")]
+    [InlineData("[ПРАКТИКА] Программирование С# -5-7,", "Программирование С#", null, "5-7")]
     [InlineData("Автоматизация DevOps · 711 · нед. 8 (разово)", "Автоматизация DevOps", "711", "8-8")]
     [InlineData("[ПРАКТИКА] Программирование С# ·504-нед. 9 (разово)", "Программирование С#", "504", "9-9")]
     [InlineData("[ПРАКТИКА] Программирование С# -уточн-нед. 8-9", "Программирование С#", null, "8-9")]
@@ -149,9 +181,51 @@ public sealed class ImportTests : IDisposable
         Assert.Contains(day!, x => x.Slot is { Subject: "Искусственный интеллект OpenCV", Room: "711", GroupName: "23-ПО-103-4р-1" });
         Assert.DoesNotContain((await teacherClient.GetFromJsonAsync<List<LessonDto>>("/api/schedule/day?date=2026-10-19", JsonOptions))!,
             x => x.Slot.Subject == "Искусственный интеллект OpenCV");
-        // Импорт создаёт учётные записи — неадмину запрещён.
-        var forbidden = await teacherClient.PostAsync("/api/schedule/import-xlsx?groups=23-ПО-103-4р-1", new ByteArrayContent(file));
+        var other = await teacherClient.GetFromJsonAsync<TeacherDto>("/api/me", JsonOptions);
+        var forbidden = await teacherClient.PostAsync(
+            $"/api/schedule/import-xlsx?groups=23-ПО-103-4р-1&teacherId={other!.Id + 1}", new ByteArrayContent(file));
         Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
+        Assert.Contains("только администратор", await forbidden.Content.ReadAsStringAsync());
+        var own = await teacherClient.PostAsync("/api/schedule/import-xlsx?groups=23-ПО-103-4р-1", new ByteArrayContent(file));
+        Assert.Equal(HttpStatusCode.OK, own.StatusCode);
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var slots = await db.ScheduleSlots.AsNoTracking()
+                .Where(x => x.Group.Name == "23-ПО-103-4р-1").ToListAsync();
+            Assert.Equal(4, slots.Count(x => x.TeacherId == other.Id));
+            Assert.Contains(slots, x => x.TeacherId != other.Id && x.Subject == "База данных PL SQL/MONGODB");
+        }
+    }
+
+    [Fact]
+    public async Task ScheduleImport_AssignsSelectedTeacherWithoutCreatingAccounts_RejectsRepeat()
+    {
+        await AuthenticateAsync("teacher", "teacher123");
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var teacher = await db.Teachers.AsNoTracking().SingleAsync(x => x.Login == "teacher");
+        var teacherCount = await db.Teachers.CountAsync();
+        var file = WithFileTeacher("Преподаватель: " + teacher.FullName);
+        var preview = await PostFileAsync<ScheduleImportPreviewDto>("/api/schedule/import-xlsx/preview", file);
+        Assert.Equal(teacher.FullName, preview.FileTeacher);
+        Assert.Equal(teacher.Id, preview.FileTeacherId);
+
+        var path = $"/api/schedule/import-xlsx?groups=23-ПО-103-4р-1&groups=23-ПО-103-4р-2&teacherId={teacher.Id}";
+        var result = await PostFileAsync<ScheduleImportResultDto>(path, file);
+        var imported = Assert.Single(result.Teachers);
+        Assert.Equal((teacher.FullName, teacher.Login, false, teacher.IsActive),
+            (imported.FullName, imported.Login, imported.Created, imported.Active));
+        Assert.Null(imported.TemporaryPassword);
+        var slots = await db.ScheduleSlots.AsNoTracking()
+            .Where(x => x.Group.Name == "23-ПО-103-4р-1" || x.Group.Name == "23-ПО-103-4р-2").ToListAsync();
+        Assert.Equal(6, slots.Count);
+        Assert.All(slots, x => Assert.Equal(teacher.Id, x.TeacherId));
+        Assert.Equal(teacherCount, await db.Teachers.CountAsync());
+
+        var again = await client.PostAsync(path, new ByteArrayContent(file));
+        Assert.Equal(HttpStatusCode.BadRequest, again.StatusCode);
+        Assert.Contains("уже загружено", await again.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -213,6 +287,15 @@ public sealed class ImportTests : IDisposable
         return stream.ToArray();
     }
 
+    private static byte[] WithFileTeacher(string header)
+    {
+        using var workbook = new XLWorkbook(new MemoryStream(CollegeSchedule()));
+        workbook.Worksheet("4 курс").Cell(5, 1).Value = header;
+        using var stream = new MemoryStream();
+        workbook.SaveAs(stream);
+        return stream.ToArray();
+    }
+
     [Fact]
     public async Task ScheduleImport_RejectsUnknownGroupsAndBrokenFiles()
     {
@@ -223,6 +306,10 @@ public sealed class ImportTests : IDisposable
         Assert.Equal(HttpStatusCode.BadRequest, none.StatusCode);
         var broken = await client.PostAsync("/api/schedule/import-xlsx/preview", new ByteArrayContent("не excel"u8.ToArray()));
         Assert.Equal(HttpStatusCode.BadRequest, broken.StatusCode);
+        var missingTeacher = await client.PostAsync(
+            "/api/schedule/import-xlsx?groups=23-ПО-103-4р-1&teacherId=2147483647", new ByteArrayContent(CollegeSchedule()));
+        Assert.Equal(HttpStatusCode.BadRequest, missingTeacher.StatusCode);
+        Assert.Contains("Преподаватель не найден.", await missingTeacher.Content.ReadAsStringAsync());
     }
 
     [Fact]

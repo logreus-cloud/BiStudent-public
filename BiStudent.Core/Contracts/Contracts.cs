@@ -33,9 +33,11 @@ public sealed record SlotDto(
 
 public sealed record SaveSlotRequest(
     int GroupId, string? NewGroupName, string Subject, string? Room, DayOfWeek DayOfWeek,
-    TimeOnly Start, TimeOnly End, WeekParity Parity, DateOnly? OneOffDate);
+    TimeOnly Start, TimeOnly End, WeekParity Parity, DateOnly? OneOffDate, List<int>? ReplaceSlotIds = null);
 
 public sealed record LessonDto(SlotDto Slot, DateOnly Date, DateTime StartsAt, DateTime EndsAt, bool Cancelled);
+public sealed record ScheduleConflictDto(string Message, List<SlotDto> Conflicts);
+
 public sealed record CancelLessonRequest(DateOnly Date, string? Reason);
 public sealed record RestoreLessonRequest(DateOnly Date);
 
@@ -99,7 +101,8 @@ public sealed record ImportResultDto(int Added, int Skipped, List<string> Errors
 
 // Импорт расписания колледжа из Excel: сначала предпросмотр (какие группы и преподаватели найдены), затем импорт выбранных групп.
 public sealed record ScheduleImportGroupDto(string Sheet, string Group, int Lessons, bool Exists, bool AlreadyLoaded = false);
-public sealed record ScheduleImportPreviewDto(DateOnly SemesterStart, List<ScheduleImportGroupDto> Groups, List<string> Teachers, List<string> Warnings);
+public sealed record ScheduleImportPreviewDto(DateOnly SemesterStart, List<ScheduleImportGroupDto> Groups, List<string> Teachers, List<string> Warnings,
+    string? FileTeacher = null, int? FileTeacherId = null);
 public sealed record ImportedTeacherDto(string FullName, string Login, string? TemporaryPassword, bool Created, bool Active);
 public sealed record ScheduleImportResultDto(int Added, int Skipped, int GroupsCreated, List<ImportedTeacherDto> Teachers, List<string> Warnings,
     int Updated = 0, int Removed = 0, List<string>? Unchanged = null);

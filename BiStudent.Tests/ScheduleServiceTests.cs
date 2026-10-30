@@ -1,5 +1,6 @@
 using System.Text;
 using BiStudent.Contracts;
+using BiStudent.Server.Services;
 using Xunit;
 
 namespace BiStudent.Tests;
@@ -61,7 +62,7 @@ public sealed class ScheduleServiceTests
         var teacher = test.AddTeacher();
         var group = test.AddGroup("ИВТ-1");
         await test.Schedule.AddSlotAsync(test.NewSlot(teacher, group, parity: WeekParity.Odd));
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+        await Assert.ThrowsAsync<ScheduleConflictException>(() =>
             test.Schedule.AddSlotAsync(test.NewSlot(teacher, group, parity: WeekParity.Odd)));
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
             test.Schedule.AddSlotAsync(test.NewSlot(teacher, group, start: new TimeOnly(10, 0),

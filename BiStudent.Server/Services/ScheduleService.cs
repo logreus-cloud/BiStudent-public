@@ -7,6 +7,11 @@ namespace BiStudent.Server.Services;
 
 public sealed record LessonOccurrence(ScheduleSlot Slot, DateOnly Date, DateTime StartsAt, DateTime EndsAt, bool Cancelled, string GroupName);
 
+public sealed class ScheduleConflictException(string message, List<ScheduleSlot> conflicts) : InvalidOperationException(message)
+{
+    public List<ScheduleSlot> Conflicts { get; } = conflicts;
+}
+
 public sealed class ScheduleService(AppDbContext db, IConfiguration configuration)
 {
     private DateOnly SemesterStart => DateOnly.Parse(configuration["Semester:Start"] ?? "2026-09-01", CultureInfo.InvariantCulture);
@@ -58,13 +63,17 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
 
     private static bool TimesOverlap(ScheduleSlot a, ScheduleSlot b) => a.Start < b.End && b.Start < a.End;
 
-    private bool DatesOverlap(ScheduleSlot a, ScheduleSlot b)
+    private bool DatesOverlap(ScheduleSlot a, ScheduleSlot b, HashSet<(int SlotId, DateOnly Date)> cancelled)
     {
         var first = a.ValidFrom > b.ValidFrom ? a.ValidFrom : b.ValidFrom;
         var last = a.ValidTo is null ? b.ValidTo : b.ValidTo is null ? a.ValidTo : a.ValidTo < b.ValidTo ? a.ValidTo : b.ValidTo;
         if (last is DateOnly end && end < first) return false;
-        if (a.OneOffDate is DateOnly aDate) return (!last.HasValue || aDate <= last) && aDate >= first && Applies(b, aDate);
-        if (b.OneOffDate is DateOnly bDate) return (!last.HasValue || bDate <= last) && bDate >= first && Applies(a, bDate);
+        if (a.OneOffDate is DateOnly aDate)
+            return (!last.HasValue || aDate <= last) && aDate >= first && Applies(b, aDate) &&
+                !cancelled.Contains((a.Id, aDate)) && !cancelled.Contains((b.Id, aDate));
+        if (b.OneOffDate is DateOnly bDate)
+            return (!last.HasValue || bDate <= last) && bDate >= first && Applies(a, bDate) &&
+                !cancelled.Contains((a.Id, bDate)) && !cancelled.Contains((b.Id, bDate));
         for (var i = 0; i < 14 && (!last.HasValue || first.AddDays(i) <= last); i++)
             if (Applies(a, first.AddDays(i)) && Applies(b, first.AddDays(i))) return true;
         return false;
@@ -76,9 +85,9 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
         if (slot.ValidTo is DateOnly end && end < slot.ValidFrom) throw new InvalidOperationException("Конец периода раньше начала.");
         if (slot.OneOffDate is DateOnly once && (once < slot.ValidFrom || slot.ValidTo is DateOnly to && once > to))
             throw new InvalidOperationException("Разовое занятие вне периода действия.");
-        var others = await db.ScheduleSlots.AsNoTracking().Where(x => x.TeacherId == slot.TeacherId && x.Id != slot.Id).ToListAsync();
-        if (others.Any(x => (ignored is null || !ignored.Contains(x.Id)) && TimesOverlap(x, slot) && DatesOverlap(x, slot)))
-            throw new InvalidOperationException("У преподавателя уже есть пара в это время.");
+        var conflicts = (await ConflictsAsync(slot)).Where(x => ignored is null || !ignored.Contains(x.Id)).ToList();
+        if (conflicts.Count > 0)
+            throw new ScheduleConflictException("У преподавателя уже есть пара в это время.", conflicts);
     }
 
     public async Task<ScheduleSlot> AddSlotAsync(ScheduleSlot slot)
@@ -87,6 +96,15 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
         db.ScheduleSlots.Add(slot);
         await db.SaveChangesAsync();
         return slot;
+    }
+
+    private async Task<List<ScheduleSlot>> ConflictsAsync(ScheduleSlot slot)
+    {
+        var others = await db.ScheduleSlots.AsNoTracking().Where(x => x.TeacherId == slot.TeacherId && x.Id != slot.Id).ToListAsync();
+        var ids = others.Select(x => x.Id).Append(slot.Id).ToArray();
+        var cancelled = (await db.SlotCancellations.AsNoTracking().Where(x => ids.Contains(x.SlotId))
+            .Select(x => new { x.SlotId, x.Date }).ToListAsync()).Select(x => (x.SlotId, x.Date)).ToHashSet();
+        return others.Where(x => TimesOverlap(x, slot) && DatesOverlap(x, slot, cancelled)).ToList();
     }
 
     public async Task UpdateSlotAsync(ScheduleSlot slot)
@@ -105,6 +123,47 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
         current.ValidTo = slot.ValidTo;
         current.OneOffDate = slot.OneOffDate;
         await db.SaveChangesAsync();
+    }
+
+    public async Task<ScheduleSlot> ReplaceAndSaveAsync(ScheduleSlot slot, List<int> replaceSlotIds, bool updating)
+    {
+        var ids = replaceSlotIds.ToHashSet();
+        var conflicts = await ConflictsAsync(slot);
+        if (ids.Count != replaceSlotIds.Count || ids.Any(id => conflicts.All(x => x.Id != id)))
+            throw new InvalidOperationException("Указана пара, которая не конфликтует с новой или не принадлежит вам.");
+        var today = DateOnly.FromDateTime(DateTime.Now);
+        var yesterday = today.AddDays(-1);
+        if (updating && slot.OneOffDate is null && conflicts.Any(x => ids.Contains(x.Id) && x.OneOffDate is null))
+            throw new InvalidOperationException("Регулярную пару нельзя заменить при редактировании — создайте новую пару или сначала измените старую.");
+        if (!updating && slot.OneOffDate is null && conflicts.Any(x => ids.Contains(x.Id) && x.OneOffDate is null) && slot.ValidFrom < today)
+        {
+            slot.ValidFrom = today;
+            conflicts = await ConflictsAsync(slot);
+        }
+        await ValidateAsync(slot, ids);
+        foreach (var conflict in conflicts.Where(x => ids.Contains(x.Id)))
+        {
+            var current = await db.ScheduleSlots.FindAsync(conflict.Id) ?? throw new KeyNotFoundException("Пара не найдена.");
+            var hasJournal = await db.AttendanceMarks.AnyAsync(x => x.SlotId == current.Id) ||
+                await db.LessonGrades.AnyAsync(x => x.SlotId == current.Id);
+            if (current.OneOffDate is not null)
+            {
+                if (hasJournal) throw new InvalidOperationException("Пару с отметками нельзя заменить — сначала перенесите или отмените её.");
+                db.ScheduleSlots.Remove(current);
+            }
+            else if (slot.OneOffDate is DateOnly date)
+                db.SlotCancellations.Add(new SlotCancellation { SlotId = current.Id, Date = date, Reason = $"Заменена: {slot.Subject}" });
+            else if (current.ValidFrom < today || hasJournal)
+            {
+                if (current.ValidFrom > yesterday) current.ValidFrom = yesterday;
+                current.ValidTo = current.ValidTo is DateOnly end && end < yesterday ? end : yesterday;
+            }
+            else db.ScheduleSlots.Remove(current);
+        }
+        await db.SaveChangesAsync();
+        if (updating) await UpdateSlotAsync(slot);
+        else slot = await AddSlotAsync(slot);
+        return slot;
     }
 
     public async Task DeleteSlotAsync(int slotId)
@@ -127,8 +186,39 @@ public sealed class ScheduleService(AppDbContext db, IConfiguration configuratio
     {
         var cancellation = await db.SlotCancellations.SingleOrDefaultAsync(x => x.SlotId == slotId && x.Date == date);
         if (cancellation is null) return;
-        db.SlotCancellations.Remove(cancellation);
-        await db.SaveChangesAsync();
+        var transaction = db.Database.CurrentTransaction;
+        var ownsTransaction = transaction is null;
+        if (ownsTransaction) transaction = await db.Database.BeginTransactionAsync();
+        var savepoint = $"RestoreSlot_{Guid.NewGuid():N}";
+        if (!ownsTransaction) await transaction!.CreateSavepointAsync(savepoint);
+        try
+        {
+            db.SlotCancellations.Remove(cancellation);
+            await db.SaveChangesAsync();
+            var slot = await db.ScheduleSlots.AsNoTracking().SingleAsync(x => x.Id == slotId);
+            var occurrence = new ScheduleSlot
+            {
+                Id = slot.Id, TeacherId = slot.TeacherId, GroupId = slot.GroupId, Subject = slot.Subject,
+                DayOfWeek = date.DayOfWeek, Start = slot.Start, End = slot.End, Parity = WeekParity.Every,
+                ValidFrom = date, ValidTo = date, OneOffDate = date
+            };
+            var conflicts = await ConflictsAsync(occurrence);
+            if (conflicts.Count > 0)
+                throw new ScheduleConflictException("На это время уже стоит другая пара.", conflicts);
+            if (ownsTransaction) await transaction!.CommitAsync();
+            else await transaction!.ReleaseSavepointAsync(savepoint);
+        }
+        catch
+        {
+            if (ownsTransaction) await transaction!.RollbackAsync();
+            else await transaction!.RollbackToSavepointAsync(savepoint);
+            db.Entry(cancellation).State = EntityState.Detached;
+            throw;
+        }
+        finally
+        {
+            if (ownsTransaction) await transaction!.DisposeAsync();
+        }
     }
 
     public Task<ScheduleSlot> AddOneOffAsync(ScheduleSlot slot, DateOnly date)

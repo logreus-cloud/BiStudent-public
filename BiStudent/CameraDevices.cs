@@ -108,6 +108,16 @@ internal static class CameraDevices
         return capture;
     }
 
+    /// Виртуальная камера Iriun отдаёт видео только при запущенном на этом компьютере приложении Iriun Webcam.
+    public static string? IriunHint(CameraDevice device)
+    {
+        if (!device.Name.Contains("Iriun", StringComparison.OrdinalIgnoreCase)) return null;
+        var processes = System.Diagnostics.Process.GetProcessesByName("IriunWebcam");
+        var running = processes.Length > 0;
+        foreach (var process in processes) process.Dispose();
+        return running ? null : "Iriun Webcam не запущен — запустите его на этом компьютере и подключите телефон";
+    }
+
     public static CameraDevice? Find(IReadOnlyList<CameraDevice> devices, string id)
     {
         foreach (var device in devices)

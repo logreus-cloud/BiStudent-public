@@ -8,7 +8,8 @@ namespace BiStudent.Server.Services;
 public sealed record ParsedLesson(string Sheet, string Group, DayOfWeek Day, TimeOnly Start, TimeOnly End,
     string Subject, string? Room, string Teacher, int FromWeek, int ToWeek, bool Once);
 
-public sealed record ParsedSchedule(DateOnly SemesterStart, List<ParsedLesson> Lessons, List<(string Sheet, string Group)> Groups, List<string> Warnings);
+public sealed record ParsedSchedule(DateOnly SemesterStart, List<ParsedLesson> Lessons, List<(string Sheet, string Group)> Groups,
+    List<string> Warnings, string? FileTeacher);
 
 /// Разбор расписания колледжа в формате «блок из пяти колонок на группу»:
 /// день · время звонка · № пары · аудитория · группа. В ячейке группы — строки «[ТИП] Предмет · аудитория · нед. 2-4, 8 (разово)»,
@@ -24,12 +25,16 @@ public static partial class CollegeScheduleParser
         var groups = new List<(string, string)>();
         var warnings = new List<string>();
         DateOnly? semester = null;
+        var fileTeachers = new List<string>();
         foreach (var sheet in workbook.Worksheets)
         {
             var used = sheet.RangeUsed();
             if (used is null) continue;
             var lastRow = used.LastRow().RowNumber();
             var lastColumn = used.LastColumn().ColumnNumber();
+            var fileTeacher = FindFileTeacher(sheet, Math.Min(lastRow, 10), lastColumn);
+            if (fileTeacher is not null && !fileTeachers.Contains(fileTeacher, StringComparer.OrdinalIgnoreCase))
+                fileTeachers.Add(fileTeacher);
             semester ??= FindSemesterStart(sheet, Math.Min(lastRow, 10), lastColumn);
             var header = FindHeaderRow(sheet, Math.Min(lastRow, 30), lastColumn);
             if (header is not int headerRow) continue;
@@ -41,7 +46,10 @@ public static partial class CollegeScheduleParser
                 ParseGroup(sheet, name, headerRow, column, lastRow, lessons, warnings);
             }
         }
-        return new ParsedSchedule(semester ?? fallbackSemesterStart, UnifyTeachers(lessons), groups, warnings);
+        if (fileTeachers.Count > 1)
+            warnings.Add($"В файле указаны разные преподаватели: {string.Join(", ", fileTeachers).TrimEnd('.')}.");
+        return new ParsedSchedule(semester ?? fallbackSemesterStart, UnifyTeachers(lessons), groups, warnings,
+            fileTeachers.Count == 1 ? fileTeachers[0] : null);
     }
 
     private static void ParseGroup(IXLWorksheet sheet, string group, int headerRow, int column, int lastRow,
@@ -66,8 +74,10 @@ public static partial class CollegeScheduleParser
             var subjectText = Text(subjectCell);
             if (subjectText.Length == 0) continue;
             var teacherRow = merged?.LastRow().RowNumber() is int last && last > row ? last : row + 1;
-            var teachers = SplitEntries(Text(sheet.Cell(teacherRow, column))).Select(TeacherName).ToList();
             var entries = SplitEntries(subjectText);
+            var teacherText = Text(sheet.Cell(teacherRow, column));
+            var teacherLines = teacherText.Split('\n').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            var teachers = (teacherLines.Count == entries.Count ? teacherLines : SplitEntries(teacherText)).Select(TeacherName).ToList();
             for (var i = 0; i < entries.Count; i++)
             {
                 var teacher = teachers.Count == 0 ? Vacancy : teachers[Math.Min(i, teachers.Count - 1)];
@@ -104,7 +114,7 @@ public static partial class CollegeScheduleParser
         subject = ""; room = null; weeks = [];
         var tag = TagPattern().Match(entry);
         var kind = tag.Success ? tag.Groups[1].Value.Trim().ToUpperInvariant() : "";
-        var rest = tag.Success ? entry[tag.Length..].Trim() : entry.Trim();
+        var rest = (tag.Success ? entry[tag.Length..].Trim() : entry.Trim()).TrimEnd(',', ' ', '\t');
         var weeksMatch = WeeksPattern().Match(rest);
         if (!weeksMatch.Success) weeksMatch = TrailingWeeksPattern().Match(rest);
         if (!weeksMatch.Success) return false;
@@ -185,6 +195,17 @@ public static partial class CollegeScheduleParser
         return null;
     }
 
+    private static string? FindFileTeacher(IXLWorksheet sheet, int lastRow, int lastColumn)
+    {
+        for (var row = 1; row <= lastRow; row++)
+            for (var column = 1; column <= Math.Min(lastColumn, 5); column++)
+            {
+                var match = FileTeacherPattern().Match(Text(sheet.Cell(row, column)));
+                if (match.Success) return TeacherName(match.Groups["name"].Value);
+            }
+        return null;
+    }
+
     private static DateOnly? FindSemesterStart(IXLWorksheet sheet, int lastRow, int lastColumn)
     {
         for (var row = 1; row <= lastRow; row++)
@@ -235,6 +256,9 @@ public static partial class CollegeScheduleParser
 
     [GeneratedRegex(@"\s*-\s*(?:уточн\S*|[A-Za-zА-ЯЁа-яё]?\d+[A-Za-zА-ЯЁа-яё]?)$", RegexOptions.IgnoreCase)]
     private static partial Regex TeacherRoomSuffix();
+
+    [GeneratedRegex(@"^\s*Преподаватель\s*:\s*(?<name>.+?)\s*(?:·.*)?$", RegexOptions.IgnoreCase)]
+    private static partial Regex FileTeacherPattern();
 
     [GeneratedRegex(@"недели\s*\d+\s*-\s*\d+\s*,\s*(\d{2}\.\d{2}\.\d{4})", RegexOptions.IgnoreCase)]
     private static partial Regex SemesterPattern();

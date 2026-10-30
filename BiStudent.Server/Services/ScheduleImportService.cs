@@ -10,13 +10,17 @@ namespace BiStudent.Server.Services;
 /// Повторный импорт заменяет расписание выбранных групп, сохраняя занятия с данными журнала.
 public sealed class ScheduleImportService(AppDbContext db, AccountService accounts, IConfiguration configuration)
 {
-    public async Task<ScheduleImportPreviewDto> PreviewAsync(Stream xlsx)
+    public async Task<ScheduleImportPreviewDto> PreviewAsync(Stream xlsx, int? teacherId = null)
     {
         var parsed = Parse(xlsx);
         var storedGroups = await db.Groups.AsNoTracking().ToListAsync();
         var groupIds = storedGroups.ToDictionary(x => x.Name, x => x.Id, StringComparer.OrdinalIgnoreCase);
         var teacherNames = parsed.Lessons.Select(x => x.Teacher).Distinct().ToList();
-        var storedTeachers = await db.Teachers.AsNoTracking().Where(x => teacherNames.Contains(x.FullName)).ToListAsync();
+        var storedTeachers = await db.Teachers.AsNoTracking()
+            .Where(x => teacherNames.Contains(x.FullName) || x.FullName == parsed.FileTeacher).ToListAsync();
+        if (teacherId is int selectedId && !await db.Teachers.AnyAsync(x => x.Id == selectedId))
+            throw new InvalidOperationException("Преподаватель не найден.");
+        var fileTeacherId = parsed.FileTeacher is null ? null : storedTeachers.FirstOrDefault(x => x.FullName == parsed.FileTeacher)?.Id;
         var teacherIds = storedTeachers.GroupBy(x => x.FullName).ToDictionary(x => x.Key, x => x.First().Id);
         var nextId = 0;
         foreach (var name in teacherNames)
@@ -29,16 +33,16 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
         {
             var exists = groupIds.TryGetValue(group.Group, out var groupId);
             var lessons = parsed.Lessons.Where(x => x.Group == group.Group).ToList();
-            var incoming = exists ? lessons.Select(x => ToSlot(x, groupId, teacherIds[x.Teacher], parsed.SemesterStart)).ToList() : [];
-            var old = slots.Where(x => x.GroupId == groupId).ToList();
+            var incoming = exists ? lessons.Select(x => ToSlot(x, groupId, teacherId ?? teacherIds[x.Teacher], parsed.SemesterStart)).ToList() : [];
+            var old = slots.Where(x => x.GroupId == groupId && (teacherId is null || x.TeacherId == teacherId)).ToList();
             groups.Add(new ScheduleImportGroupDto(group.Sheet, group.Group, lessons.Count, exists,
                 exists && (await ScheduleReplacement.IsUnchangedAsync(db, old, incoming, today)).Unchanged));
         }
         var teachers = parsed.Lessons.Select(x => x.Teacher).Distinct().Order(StringComparer.CurrentCulture).ToList();
-        return new ScheduleImportPreviewDto(parsed.SemesterStart, groups, teachers, parsed.Warnings);
+        return new ScheduleImportPreviewDto(parsed.SemesterStart, groups, teachers, parsed.Warnings, parsed.FileTeacher, fileTeacherId);
     }
 
-    public async Task<ScheduleImportResultDto> ImportAsync(Stream xlsx, IReadOnlyCollection<string> selectedGroups)
+    public async Task<ScheduleImportResultDto> ImportAsync(Stream xlsx, IReadOnlyCollection<string> selectedGroups, int? teacherId = null)
     {
         if (selectedGroups.Count == 0) throw new InvalidOperationException("Выберите хотя бы одну группу.");
         var parsed = Parse(xlsx);
@@ -46,7 +50,12 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
         var unknown = selected.Where(g => parsed.Groups.All(x => !x.Group.Equals(g, StringComparison.OrdinalIgnoreCase))).ToList();
         if (unknown.Count > 0) throw new InvalidOperationException($"В файле нет групп: {string.Join(", ", unknown)}.");
         var lessons = parsed.Lessons.Where(x => selected.Contains(x.Group)).ToList();
-        var warnings = parsed.Warnings.Where(w => selected.Any(g => w.Contains(g, StringComparison.OrdinalIgnoreCase))).ToList();
+        Teacher? selectedTeacher = null;
+        if (teacherId is int id)
+            selectedTeacher = await db.Teachers.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id)
+                ?? throw new InvalidOperationException("Преподаватель не найден.");
+        var warnings = parsed.Warnings.Where(w => selected.Any(g => w.Contains(g, StringComparison.OrdinalIgnoreCase)) ||
+            w.StartsWith("В файле указаны разные преподаватели:", StringComparison.Ordinal)).ToList();
         var semester = DateOnly.Parse(configuration["Semester:Start"] ?? "2026-09-01", CultureInfo.InvariantCulture);
         if (Monday(semester) != parsed.SemesterStart)
             warnings.Add($"Начало семестра в файле — {parsed.SemesterStart:dd.MM.yyyy}, в настройках сервера — {semester:dd.MM.yyyy}. Недели считаются по файлу.");
@@ -64,8 +73,15 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
 
         var teachers = new List<ImportedTeacherDto>();
         var teacherIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (selectedTeacher is not null)
+            teachers.Add(new ImportedTeacherDto(selectedTeacher.FullName, selectedTeacher.Login, null, false, selectedTeacher.IsActive));
         foreach (var name in lessons.Select(x => x.Teacher).Distinct())
         {
+            if (selectedTeacher is not null)
+            {
+                teacherIds[name] = selectedTeacher.Id;
+                continue;
+            }
             var vacancy = name == CollegeScheduleParser.Vacancy;
             var existing = await db.Teachers.AsNoTracking().FirstOrDefaultAsync(x => x.FullName == name);
             if (existing is not null)
@@ -89,7 +105,7 @@ public sealed class ScheduleImportService(AppDbContext db, AccountService accoun
         var today = DateOnly.FromDateTime(DateTime.Now);
         foreach (var name in groupNames)
         {
-            var old = existingSlots.Where(x => x.GroupId == groupIds[name]).ToList();
+            var old = existingSlots.Where(x => x.GroupId == groupIds[name] && (teacherId is null || x.TeacherId == teacherId)).ToList();
             var incoming = lessons.Where(x => x.Group.Equals(name, StringComparison.OrdinalIgnoreCase))
                 .Select(x => ToSlot(x, groupIds[name], teacherIds[x.Teacher], parsed.SemesterStart)).ToList();
             if ((await ScheduleReplacement.IsUnchangedAsync(db, old, incoming, today)).Unchanged)
