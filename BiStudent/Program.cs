@@ -1,4 +1,5 @@
 using System.Globalization;
+using Velopack;
 
 namespace BiStudent;
 
@@ -9,6 +10,7 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        VelopackApp.Build().Run();
         var culture = CultureInfo.GetCultureInfo("ru-RU");
         CultureInfo.CurrentCulture = culture;
         CultureInfo.CurrentUICulture = culture;
@@ -20,6 +22,7 @@ internal static class Program
         Application.SetCompatibleTextRenderingDefault(false);
 
         if (args.Contains("--self-test")) return SelfTest();
+        if (args.Contains("--update-self-test")) return UpdateSelfTest();
         var screenshots = Array.IndexOf(args, "--screenshots");
         if (screenshots >= 0 && args.Length >= screenshots + 4)
             return Screenshots(args[screenshots + 1], args[screenshots + 2], args[screenshots + 3]);
@@ -89,7 +92,12 @@ internal static class Program
                 }
                 using var main = new MainForm(api);
                 Application.Run(main);
-                if (!main.SignedOut) return 0;
+                if (!main.SignedOut)
+                {
+                    try { AppUpdater.ApplyOnExit(); }
+                    catch { }
+                    return 0;
+                }
             }
         }
     }
@@ -99,6 +107,44 @@ internal static class Program
         var directory = Path.Combine(AppContext.BaseDirectory, "diagnostics");
         Directory.CreateDirectory(directory);
         return directory;
+    }
+
+    private static int UpdateSelfTest()
+    {
+        try
+        {
+            var report = Path.Combine(Diagnostics(), "update.txt");
+            if (!AppUpdater.IsInstalled && AppUpdater.InitError is { } initError)
+            {
+                File.WriteAllText(report, initError);
+                return 1;
+            }
+            if (!AppUpdater.IsInstalled)
+            {
+                File.WriteAllText(report, "Программа не установлена через Velopack.");
+                return 3;
+            }
+            var version = AppUpdater.CheckAndDownloadAsync(CancellationToken.None).GetAwaiter().GetResult();
+            if (AppUpdater.LastError is { } error)
+            {
+                File.WriteAllText(report, error);
+                return 1;
+            }
+            if (version is null)
+            {
+                File.WriteAllText(report, "Обновлений нет.");
+                return 2;
+            }
+            AppUpdater.ApplyOnExit();
+            File.WriteAllText(report, $"Обновление {version} скачано и поставлено в очередь.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            try { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "diagnostics", "update.txt"), ex.ToString()); }
+            catch { }
+            return 1;
+        }
     }
 
     private static int SelfTest()

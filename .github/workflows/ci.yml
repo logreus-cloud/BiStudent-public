@@ -72,22 +72,43 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     permissions:
       contents: write
+    env:
+      VERSION: 1.2.${{ github.run_number }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 10.0.x
+      - name: Restore local tools
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .config | Out-Null
+          Copy-Item dotnet-tools.json .config/dotnet-tools.json
+          dotnet tool restore
       - name: Package
         shell: pwsh
-        run: ./scripts/package.ps1
+        run: ./scripts/package.ps1 -Version $env:VERSION
       - uses: actions/upload-artifact@v5
         with:
           name: BiStudent-win-x64
           path: dist/BiStudent-win-x64.zip
-      - name: Publish release
+      - name: Download previous release
+        continue-on-error: true
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "v1.2.${{ github.run_number }}" dist/BiStudent-win-x64.zip
-          --target "${{ github.sha }}" --title "BiStudent 1.2.${{ github.run_number }}"
-          --notes "Windows 10/11 x64: скачайте BiStudent-win-x64.zip, распакуйте целиком и запустите BiStudent.exe. Устанавливать ничего не нужно. Войдите логином и паролем, которые выдал администратор; при первом входе нужен интернет — данные загрузятся из облака."
+        run: dotnet vpk download github --repoUrl "https://github.com/${{ github.repository }}" --token $env:GH_TOKEN -o releases
+      - name: Pack Velopack release
+        shell: pwsh
+        run: dotnet vpk pack --packId BiStudent.Desktop --packTitle BiStudent --packVersion $env:VERSION --packDir out/BiStudent --mainExe BiStudent.exe --runtime win-x64 -o releases
+      - name: Upload Velopack release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: dotnet vpk upload github --repoUrl "https://github.com/${{ github.repository }}" --token $env:GH_TOKEN -o releases --publish --releaseName "BiStudent $env:VERSION" --tag "v$env:VERSION" --targetCommitish "${{ github.sha }}" --merge
+      - name: Release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "v$env:VERSION" --notes "Windows 10/11 x64: установите программу через BiStudent.Desktop-win-Setup.exe или распакуйте переносную версию BiStudent.Desktop-win-Portable.zip. Дальше программа обновляется сама. Войдите логином и паролем, которые выдал администратор; при первом входе нужен интернет — данные загрузятся из облака."

@@ -16,30 +16,40 @@ internal sealed class MainForm : DarkForm
     private readonly Panel host = new() { Dock = DockStyle.Fill, BackColor = Theme.Background };
     private readonly Dictionary<string, ModernButton> nav = [];
     private readonly ContextMenuStrip userMenu = new() { BackColor = Theme.SurfaceHover, ForeColor = Theme.Text, Font = Theme.Font(10) };
+    private readonly Label updateStatus = Ui.Label("", 8.5f, Theme.Accent);
     private readonly Label syncStatus = Ui.Label("", 8.5f, Theme.Muted);
     private readonly ToolTip syncToolTip = new();
     private readonly System.Windows.Forms.Timer syncTimer = new() { Interval = 30000 };
+    private readonly System.Windows.Forms.Timer updateTimer = new() { Interval = 6 * 60 * 60 * 1000 };
+    private readonly CancellationTokenSource updateCancellation = new();
     private Page? current;
+    private TaskCompletionSource? switchCompletion;
     private Label? userName;
     private Label? userAvatar;
+    private string? updateVersion;
     private bool switching;
     private bool closingAfterLeave;
     private bool leaving;
     private bool syncBusy;
+    private bool updateBusy;
+    private bool applyingUpdate;
+    private bool closeAfterUpdate;
 
     public MainForm(ApiClient api)
     {
         this.api = api;
-        Text = "BiStudent · Кабинет преподавателя";
+        Text = AppUpdater.CurrentVersion is { } version ? $"BiStudent {version} · Кабинет преподавателя" : "BiStudent · Кабинет преподавателя";
         Size = new Size(1440, 900);
         MinimumSize = new Size(1180, 720);
         StartPosition = FormStartPosition.CenterScreen;
         BuildShell();
         api.Unauthorized += OnUnauthorized;
         syncTimer.Tick += async (_, _) => await UpdateSyncAsync();
+        updateTimer.Tick += async (_, _) => await CheckForUpdateAsync();
         Shown += async (_, _) =>
         {
             syncTimer.Start(); _ = UpdateSyncAsync();
+            updateTimer.Start(); _ = CheckForUpdateAsync();
             if (AutoOpenFirstPage && current is null) await ShowPageAsync("today");
         };
     }
@@ -53,9 +63,10 @@ internal sealed class MainForm : DarkForm
 
     private void BuildShell()
     {
-        var sidebar = new TableLayoutPanel { Dock = DockStyle.Left, Width = 250, BackColor = Theme.Sidebar, RowCount = 4, Padding = new Padding(16, 22, 16, 16) };
+        var sidebar = new TableLayoutPanel { Dock = DockStyle.Left, Width = 250, BackColor = Theme.Sidebar, RowCount = 5, Padding = new Padding(16, 22, 16, 16) };
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        sidebar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         sidebar.RowStyles.Add(new RowStyle(SizeType.Absolute, 64));
 
@@ -79,9 +90,14 @@ internal sealed class MainForm : DarkForm
         }
         sidebar.Controls.Add(menu, 0, 1);
 
+        updateStatus.AutoSize = true; updateStatus.MinimumSize = new Size(0, 28);
+        updateStatus.AutoEllipsis = true; updateStatus.Cursor = Cursors.Hand; updateStatus.Visible = false;
+        updateStatus.Click += (_, _) => InstallUpdate();
+        sidebar.Controls.Add(updateStatus, 0, 2);
+
         syncStatus.AutoEllipsis = true; syncStatus.Cursor = Cursors.Hand; syncStatus.Visible = false;
         syncStatus.Click += async (_, _) => await UpdateSyncAsync(run: true);
-        sidebar.Controls.Add(syncStatus, 0, 2);
+        sidebar.Controls.Add(syncStatus, 0, 3);
 
         var user = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2, BackColor = Theme.Sidebar, Margin = Padding.Empty };
         user.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44)); user.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); user.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44));
@@ -111,10 +127,60 @@ internal sealed class MainForm : DarkForm
         }
         avatar.Click += OpenUserMenu; nameLabel.Click += OpenUserMenu; roleLabel.Click += OpenUserMenu;
         user.Click += OpenUserMenu;
-        sidebar.Controls.Add(user, 0, 3);
+        sidebar.Controls.Add(user, 0, 4);
 
         Controls.Add(host);
         Controls.Add(sidebar);
+    }
+
+    private async void InstallUpdate()
+    {
+        if (updateVersion is null || applyingUpdate || leaving || IsDisposed) return;
+        applyingUpdate = true;
+        updateStatus.Enabled = false;
+        var pageLeft = false;
+        try
+        {
+            if (MessageBox.Show(this, $"Программа закроется и сразу откроется снова. Установить обновление {updateVersion} сейчас?",
+                "BiStudent", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (switchCompletion is { } completion) await completion.Task;
+            if (leaving || IsDisposed) return;
+            leaving = true;
+            pageLeft = true;
+            await PrepareToCloseAsync();
+            AppUpdater.ApplyAndRestart();
+        }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Ошибка обновления", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+        finally
+        {
+            leaving = false;
+            applyingUpdate = false;
+            if (!IsDisposed) updateStatus.Enabled = true;
+            if (closeAfterUpdate && !IsDisposed) { closeAfterUpdate = false; Close(); }
+            // Обновление не встало, а страница уже остановлена (например, камера) — открываем её заново.
+            else if (pageLeft && !IsDisposed && nav.FirstOrDefault(x => x.Value.Selected).Key is { } key)
+            {
+                try { await ShowPageAsync(key); }
+                catch (Exception ex) { Ui.Toast(this, ex.Message, true); }
+            }
+        }
+    }
+
+    private async Task CheckForUpdateAsync()
+    {
+        if (updateBusy || updateCancellation.IsCancellationRequested || IsDisposed) return;
+        updateBusy = true;
+        try
+        {
+            var cancellationToken = updateCancellation.Token;
+            var version = await Task.Run(() => AppUpdater.CheckAndDownloadAsync(cancellationToken));
+            if (version is null || updateCancellation.IsCancellationRequested || IsDisposed) return;
+            updateVersion = version;
+            updateStatus.Text = $"⬆ Обновление {version} — установить";
+            updateStatus.Visible = true;
+            updateTimer.Stop();
+        }
+        finally { updateBusy = false; }
     }
 
     private async Task UpdateSyncAsync(bool run = false)
@@ -181,8 +247,10 @@ internal sealed class MainForm : DarkForm
 
     internal async Task ShowPageAsync(string key)
     {
-        if (switching || leaving || IsDisposed) return;
+        if (switching || leaving || applyingUpdate || IsDisposed) return;
         switching = true;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        switchCompletion = completion;
         if (api.Teacher is { } teacher && userName is not null && userAvatar is not null) { userName.Text = teacher.FullName; userAvatar.Text = Initials(teacher.FullName); }
         try
         {
@@ -203,7 +271,12 @@ internal sealed class MainForm : DarkForm
             try { await page.LoadAsync(); }
             catch (ApiException ex) { LastPageError = ex.Message; Ui.Toast(this, ex.Message, true); }
         }
-        finally { switching = false; }
+        finally
+        {
+            switching = false;
+            switchCompletion = null;
+            completion.SetResult();
+        }
     }
 
     internal Task OpenCamera(LessonDto lesson)
@@ -244,15 +317,21 @@ internal sealed class MainForm : DarkForm
         });
     }
 
+    private Task PrepareToCloseAsync() => current?.OnLeaveAsync() ?? Task.CompletedTask;
+
     protected override async void OnFormClosing(FormClosingEventArgs e)
     {
+        // Выход или истёкшая сессия во время установки обновления: закроемся, если обновление отменят или оно не встанет.
+        if (applyingUpdate) { e.Cancel = true; closeAfterUpdate = true; return; }
         syncTimer.Stop();
+        updateTimer.Stop();
+        updateCancellation.Cancel();
         if (!closingAfterLeave && current is not null)
         {
             e.Cancel = true;
             if (leaving) return;
             leaving = true;
-            try { await current.OnLeaveAsync(); }
+            try { await PrepareToCloseAsync(); }
             finally
             {
                 closingAfterLeave = true;
@@ -262,6 +341,8 @@ internal sealed class MainForm : DarkForm
         }
         api.Unauthorized -= OnUnauthorized;
         syncTimer.Dispose();
+        updateTimer.Dispose();
+        updateCancellation.Dispose();
         syncToolTip.Dispose();
         userMenu.Dispose();
         base.OnFormClosing(e);

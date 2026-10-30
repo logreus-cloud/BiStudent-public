@@ -22,14 +22,6 @@ using System.Runtime.InteropServices;
 // Следующий GUID служит для идентификации библиотеки типов, если этот проект будет видимым для COM
 [assembly: Guid("b8afd767-65de-4640-8cef-beb6bca065f6")]
 
-// Сведения о версии сборки состоят из указанных ниже четырех значений:
-//
-//      Основной номер версии
-//      Дополнительный номер версии
-//      Номер сборки
-//      Редакция
-//
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+// Версию сборки задаёт MSBuild из свойства Version (scripts/package.ps1 -Version).
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("BiStudent.Client.Tests")]

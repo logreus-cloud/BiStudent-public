@@ -3,7 +3,7 @@
   Собирает dist/BiStudent-win-x64.zip: распаковал, запустил BiStudent.exe, вошёл.
   В корне архива клиент одним файлом и модели, в папке Server встроенный сервер, который клиент запускает сам.
 #>
-param([string]$Output = 'dist')
+param([string]$Output = 'dist', [string]$Version = '1.0.0')
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -13,7 +13,7 @@ $zip = Join-Path $output 'BiStudent-win-x64.zip'
 # Нативные библиотеки (OpenCV, SQLite) лежат рядом с exe: при самораспаковке первый запуск ждал распаковки ~200 МБ во временную папку.
 # ReadyToRun компилирует код заранее, чтобы клиент и сервер не тратили секунды на JIT при каждом старте.
 $single = @('-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-p:PublishSingleFile=true',
-    '-p:PublishReadyToRun=true', '-p:DebugType=None', '-p:DebugSymbols=false')
+    '-p:PublishReadyToRun=true', '-p:DebugType=None', '-p:DebugSymbols=false', "-p:Version=$Version")
 
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 dotnet publish (Join-Path $root 'BiStudent\BiStudent.csproj') @single -o $stage
@@ -24,9 +24,13 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 @'
 BiStudent — электронный журнал преподавателя
 
-1. Распакуйте архив целиком в любую папку (не запускайте из самого архива).
-2. Запустите BiStudent.exe.
-3. Войдите логином и паролем, которые выдал администратор. Нужен интернет: при первом входе
+1. Основной способ: запустите BiStudent.Desktop-win-Setup.exe. Программа установится без прав
+   администратора, создаст ярлык на рабочем столе и будет обновляться сама.
+2. Переносная версия: распакуйте BiStudent.Desktop-win-Portable.zip целиком в любую папку
+   (не запускайте из самого архива), затем запустите BiStudent.exe. Она тоже обновляется сама.
+3. Архив BiStudent-win-x64.zip для ручного запуска: распакуйте его целиком в любую папку
+   и запустите BiStudent.exe.
+4. Войдите логином и паролем, которые выдал администратор. Нужен интернет: при первом входе
    расписание, группы и журналы загружаются из облака, дальше программа работает и без сети.
 
 Нужна Windows 10/11 x64, устанавливать .NET не нужно. Папки Models и Server должны лежать рядом с BiStudent.exe.
