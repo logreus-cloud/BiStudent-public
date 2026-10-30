@@ -131,6 +131,7 @@ function setup({ search = '', secure = true, mediaDevices = true, replies = [], 
     stepLabels.set(match[1], new Element('span'));
   const el = id => elements.get(id);
   const document = {
+    documentElement: { lang: 'ru' },
     getElementById: el,
     createElement: tag => new Element(tag),
     addEventListener() {},
