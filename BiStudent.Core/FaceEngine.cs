@@ -37,12 +37,47 @@ public sealed class FaceEngine : IDisposable
     public FaceEngine()
     {
         var models = Path.Combine(AppContext.BaseDirectory, "Models");
-        detectionModel = Path.Combine(models, "face_detection_yunet_2023mar.onnx");
-        var recognitionModel = Path.Combine(models, "face_recognition_sface_2021dec.onnx");
-        if (!File.Exists(detectionModel)) throw new FileNotFoundException("Не найдена модель YuNet", detectionModel);
-        if (!File.Exists(recognitionModel)) throw new FileNotFoundException("Не найдена модель SFace", recognitionModel);
+        var detectionSource = Path.Combine(models, "face_detection_yunet_2023mar.onnx");
+        var recognitionSource = Path.Combine(models, "face_recognition_sface_2021dec.onnx");
+        if (!File.Exists(detectionSource)) throw new FileNotFoundException("Не найдена модель YuNet", detectionSource);
+        if (!File.Exists(recognitionSource)) throw new FileNotFoundException("Не найдена модель SFace", recognitionSource);
+        detectionModel = OpenCvSafePath(detectionSource);
+        var recognitionModel = OpenCvSafePath(recognitionSource);
         recognitionNet = CvDnn.ReadNetFromOnnx(recognitionModel) ?? throw new InvalidOperationException("Не удалось загрузить модель SFace.");
     }
+
+    // Native OpenCV on Windows opens files through narrow (ANSI) paths, so a model
+    // under e.g. "OneDrive\Рабочий стол" fails with "Can't read ONNX file".
+    // Such models are copied once into the first folder whose path is plain ASCII.
+    private static string OpenCvSafePath(string source)
+    {
+        if (IsAscii(source)) return source;
+        string[] candidates =
+        [
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BiStudent", "Models"),
+            Path.Combine(Path.GetTempPath(), "BiStudent", "Models"),
+            Path.Combine(Path.GetPathRoot(Environment.SystemDirectory) is { Length: > 0 } root ? root : @"C:\", "BiStudentModels")
+        ];
+        foreach (var directory in candidates)
+        {
+            if (!IsAscii(directory) || !Path.IsPathRooted(directory)) continue;
+            try
+            {
+                Directory.CreateDirectory(directory);
+                var target = Path.Combine(directory, Path.GetFileName(source));
+                if (!File.Exists(target) || new FileInfo(target).Length != new FileInfo(source).Length)
+                    File.Copy(source, target, true);
+                return target;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+        throw new InvalidOperationException(
+            $"Путь к модели содержит не латинские символы, и её не удалось скопировать в папку с латинским путём. Перенесите сервер, например, в C:\\BiStudent. Путь: {source}");
+    }
+
+    private static bool IsAscii(string value) => value.All(char.IsAscii);
 
     public void Train(IEnumerable<(int StudentId, byte[] Image)> samples)
     {
