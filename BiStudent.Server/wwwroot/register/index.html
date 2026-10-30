@@ -3,80 +3,86 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Регистрация лица — BiStudent</title>
+  <title data-i18n="title">Регистрация лица — BiStudent</title>
   <link rel="stylesheet" href="register.css">
   <script src="register.js" defer></script>
 </head>
 <body>
   <header class="site-header">
     <div class="shell">
-      <strong class="brand">BiStudent</strong>
-      <p>Регистрация лица для учёта посещаемости</p>
+      <div class="header-row">
+        <strong class="brand">BiStudent</strong>
+        <div class="lang-switch" role="group" aria-label="Язык" data-i18n-aria-label="languageLabel">
+          <button type="button" id="language-ru" aria-pressed="true">RU</button>
+          <button type="button" id="language-kk" aria-pressed="false">KZ</button>
+        </div>
+      </div>
+      <p data-i18n="header">Регистрация лица для учёта посещаемости</p>
     </div>
   </header>
   <main class="shell">
-    <nav class="steps" aria-label="Шаги регистрации">
-      <span data-step-label="1">1 Код</span>
-      <span data-step-label="2">2 Студент</span>
-      <span data-step-label="3">3 Снимки</span>
-      <span data-step-label="4">4 Готово</span>
+    <nav class="steps" aria-label="Шаги регистрации" data-i18n-aria-label="stepsLabel">
+      <span data-step-label="1" data-i18n="step1">1 Код</span>
+      <span data-step-label="2" data-i18n="step2">2 Студент</span>
+      <span data-step-label="3" data-i18n="step3">3 Снимки</span>
+      <span data-step-label="4" data-i18n="step4">4 Готово</span>
     </nav>
     <section class="card" id="step-1" aria-labelledby="title-1">
-      <h1 id="title-1">Введите код группы</h1>
-      <p class="hint">Код выдаёт преподаватель, например K7PM-Q2XA</p>
+      <h1 id="title-1" data-i18n="codeTitle">Введите код группы</h1>
+      <p class="hint" data-i18n="codeHint">Код выдаёт преподаватель, например K7PM-Q2XA</p>
       <form id="code-form">
-        <label for="code">Код группы</label>
+        <label for="code" data-i18n="codeLabel">Код группы</label>
         <input id="code" name="code" inputmode="text" autocomplete="off" autocapitalize="characters" maxlength="9" required>
         <p class="error" id="code-error" aria-live="polite"></p>
-        <button type="submit" id="code-button">Продолжить</button>
+        <button type="submit" id="code-button" data-i18n="continue">Продолжить</button>
       </form>
     </section>
     <section class="card" id="step-2" aria-labelledby="title-2" hidden>
-      <h1 id="title-2">Выберите себя в группе</h1>
+      <h1 id="title-2" data-i18n="studentTitle">Выберите себя в группе</h1>
       <p id="group-name" class="group-name"></p>
       <p id="expires" class="hint"></p>
-      <label for="student-search">Поиск по ФИО</label>
-      <input id="student-search" type="search" autocomplete="off" placeholder="Начните вводить фамилию">
-      <div id="students" class="student-list" role="radiogroup" aria-label="Студенты группы"></div>
-      <p id="replacement-warning" class="notice" hidden>Новые снимки заменят прежние после подтверждения преподавателем.</p>
+      <label for="student-search" data-i18n="search">Поиск по ФИО</label>
+      <input id="student-search" type="search" autocomplete="off" placeholder="Начните вводить фамилию" data-i18n-placeholder="searchPlaceholder">
+      <div id="students" class="student-list" role="radiogroup" aria-label="Студенты группы" data-i18n-aria-label="studentsLabel"></div>
+      <p id="replacement-warning" class="notice" data-i18n="replacementWarning" hidden>Новые снимки заменят прежние после подтверждения преподавателем.</p>
       <label class="consent">
         <input id="consent" type="checkbox">
-        <span>Я подтверждаю, что выбрал(а) себя, и даю согласие на обработку изображения моего лица (биометрических персональных данных) для учёта посещаемости. Снимки видит только преподаватель; полные кадры не сохраняются.</span>
+        <span data-i18n="consent">Я подтверждаю, что выбрал(а) себя, и даю согласие на обработку изображения моего лица (биометрических персональных данных) для учёта посещаемости. Снимки видит только преподаватель; полные кадры не сохраняются.</span>
       </label>
       <p class="error" id="student-error" aria-live="polite"></p>
-      <button type="button" id="student-next" disabled>Далее</button>
+      <button type="button" id="student-next" data-i18n="next" disabled>Далее</button>
     </section>
     <section class="card" id="step-3" aria-labelledby="title-3" hidden>
-      <h1 id="title-3">Сделайте три снимка</h1>
-      <p class="hint">Хорошее освещение спереди, без очков от солнца и масок, лицо целиком в рамке.</p>
+      <h1 id="title-3" data-i18n="photosTitle">Сделайте три снимка</h1>
+      <p class="hint" data-i18n="photosHint">Хорошее освещение спереди, без очков от солнца и масок, лицо целиком в рамке.</p>
       <p id="pose" class="pose"></p>
       <div id="camera-mode" hidden>
-        <label for="camera-select" id="camera-label" hidden>Камера</label>
+        <label for="camera-select" id="camera-label" data-i18n="cameraLabel" hidden>Камера</label>
         <select id="camera-select" hidden></select>
         <div class="viewfinder">
           <video id="video" autoplay muted playsinline></video>
           <div class="oval" aria-hidden="true"></div>
         </div>
-        <button type="button" id="capture">Сделать снимок</button>
+        <button type="button" id="capture" data-i18n="capture">Сделать снимок</button>
       </div>
       <div id="file-mode" hidden>
-        <p class="notice">Браузер не дал доступ к камере на этой странице — сделайте три снимка через камеру телефона.</p>
-        <div class="file-row"><label for="file-0">1. Смотрите прямо в камеру</label><input id="file-0" type="file" accept="image/*" capture="user"></div>
-        <div class="file-row"><label for="file-1">2. Слегка поверните голову влево</label><input id="file-1" type="file" accept="image/*" capture="user"></div>
-        <div class="file-row"><label for="file-2">3. Слегка поверните голову вправо</label><input id="file-2" type="file" accept="image/*" capture="user"></div>
+        <p class="notice" data-i18n="fileNotice">Браузер не дал доступ к камере на этой странице — сделайте три снимка через камеру телефона.</p>
+        <div class="file-row"><label for="file-0" data-i18n="filePose0">1. Смотрите прямо в камеру</label><input id="file-0" type="file" accept="image/*" capture="user"></div>
+        <div class="file-row"><label for="file-1" data-i18n="filePose1">2. Слегка поверните голову влево</label><input id="file-1" type="file" accept="image/*" capture="user"></div>
+        <div class="file-row"><label for="file-2" data-i18n="filePose2">3. Слегка поверните голову вправо</label><input id="file-2" type="file" accept="image/*" capture="user"></div>
       </div>
-      <div id="thumbnails" class="thumbnails" aria-label="Сделанные снимки"></div>
+      <div id="thumbnails" class="thumbnails" aria-label="Сделанные снимки" data-i18n-aria-label="thumbnailsLabel"></div>
       <p class="error" id="submit-error" aria-live="polite"></p>
       <ul class="problems" id="problems"></ul>
-      <div class="actions"><button type="button" class="secondary" id="back">Назад</button><button type="button" id="submit" disabled>Отправить</button></div>
+      <div class="actions"><button type="button" class="secondary" id="back" data-i18n="back">Назад</button><button type="button" id="submit" data-i18n="submit" disabled>Отправить</button></div>
     </section>
     <section class="card" id="step-4" aria-labelledby="title-4" hidden>
-      <h1 id="title-4">Снимки отправлены</h1>
+      <h1 id="title-4" data-i18n="sentTitle">Снимки отправлены</h1>
       <p id="completed-student" class="group-name"></p>
       <p id="completed-message"></p>
-      <button type="button" id="another">Зарегистрировать другого студента</button>
+      <button type="button" id="another" data-i18n="another">Зарегистрировать другого студента</button>
     </section>
   </main>
-  <footer class="shell">Данные передаются только на сервер учебного заведения</footer>
+  <footer class="shell" data-i18n="footer">Данные передаются только на сервер учебного заведения</footer>
 </body>
 </html>

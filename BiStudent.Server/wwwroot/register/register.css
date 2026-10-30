@@ -14,6 +14,11 @@ input[type="checkbox"], input[type="radio"] { width: 20px; height: 20px; accent-
 label { display: block; font-weight: 600; }
 .shell { width: min(100% - 32px, 560px); margin-inline: auto; }
 .site-header { background: #fff; border-bottom: 1px solid #dfe4ee; padding: 21px 0; }
+.header-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.lang-switch { display: inline-flex; flex: none; gap: 2px; border: 1px solid #dfe4ee; border-radius: 9px; padding: 3px; background: #f3f5f9; }
+.lang-switch button { min-height: 32px; border-radius: 6px; padding: 5px 10px; background: transparent; color: #526078; font-size: .78rem; }
+.lang-switch button:hover:not(:disabled) { background: #e8edf8; }
+.lang-switch button[aria-pressed="true"], .lang-switch button[aria-pressed="true"]:hover { background: #1f3a8a; color: #fff; }
 .brand { color: #1f3a8a; font-size: 1.35rem; letter-spacing: .01em; }
 .site-header p { margin: 5px 0 0; color: #526078; font-size: .92rem; }
 .steps { display: flex; gap: 5px; margin: 25px 0 16px; }
