@@ -5,7 +5,10 @@ let code = '';
 let group = null;
 let selectedId = null;
 let captures = [null, null, null];
+let fileReads = [0, 0, 0];
+let pendingReads = [0, 0, 0];
 let stream = null;
+let cameraStarting = false;
 let captureIndex = 0;
 let retaking = false;
 let sending = false;
@@ -157,7 +160,10 @@ function setLanguage(lang) {
 
 function showStep(number) {
   if (sending && number !== 4) return;
-  if (currentStep === 3 && number !== 3) registrationGeneration++;
+  if (currentStep === 3 && number !== 3) {
+    registrationGeneration++;
+    pendingReads.fill(0);
+  }
   currentStep = number;
   for (let index = 1; index <= 4; index++) {
     $(`step-${index}`).hidden = index !== number;
@@ -170,6 +176,7 @@ function showStep(number) {
 
 function stopCamera() {
   cameraAttempt++;
+  cameraStarting = false;
   if (stream) stream.getTracks().forEach(track => track.stop());
   stream = null;
   $('video').srcObject = null;
@@ -204,7 +211,7 @@ function updateButtons() {
   $('back').disabled = sending;
   $('another').disabled = sending;
   $('camera-select').disabled = sending;
-  $('submit').disabled = sending || currentStep !== 3 || captures.some(image => !image);
+  $('submit').disabled = sending || cameraStarting || pendingReads.some(count => count) || currentStep !== 3 || captures.some(image => !image);
   $('capture').disabled = sending || currentStep !== 3 || !stream ||
     (captures[captureIndex] !== null && !retaking);
   for (let index = 0; index < 3; index++) $(`file-${index}`).disabled = sending;
@@ -340,6 +347,8 @@ async function startCamera(deviceId) {
     updateCaptures();
     return;
   }
+  cameraStarting = true;
+  updateButtons();
   try {
     const nextStream = await navigator.mediaDevices.getUserMedia({
       video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
@@ -371,8 +380,10 @@ async function startCamera(deviceId) {
     stopCamera();
     $('camera-mode').hidden = true;
     $('file-mode').hidden = false;
+  } finally {
+    if (attempt === cameraAttempt) cameraStarting = false;
+    updateCaptures();
   }
-  updateCaptures();
 }
 
 $('code').addEventListener('input', event => { event.target.value = formatCode(event.target.value); });
@@ -382,6 +393,7 @@ $('consent').addEventListener('change', updateNext);
 $('student-next').addEventListener('click', () => {
   if (sending) return;
   captures = [null, null, null];
+  pendingReads.fill(0);
   for (let index = 0; index < 3; index++) $(`file-${index}`).value = '';
   captureIndex = 0;
   retaking = false;
@@ -396,6 +408,7 @@ $('capture').addEventListener('click', () => {
   if (sending || currentStep !== 3 || !stream) return;
   const video = $('video');
   if (!video.videoWidth || !video.videoHeight) return;
+  fileReads[captureIndex]++;
   captures[captureIndex] = scaledJpeg(video, video.videoWidth, video.videoHeight);
   retaking = false;
   captureIndex = captures.findIndex(image => !image);
@@ -408,22 +421,31 @@ for (let index = 0; index < 3; index++) {
     const file = event.target.files?.[0];
     if (!file) return;
     const generation = registrationGeneration;
+    const read = ++fileReads[index];
+    pendingReads[index]++;
+    updateButtons();
     try {
       const bitmap = await createImageBitmap(file);
-      if (generation !== registrationGeneration || sending || currentStep !== 3) { bitmap.close(); return; }
-      captures[index] = scaledJpeg(bitmap, bitmap.width, bitmap.height);
-      bitmap.close();
-      updateCaptures();
-      clearError('submit-error');
+      try {
+        if (read !== fileReads[index] || generation !== registrationGeneration || sending || currentStep !== 3) return;
+        captures[index] = scaledJpeg(bitmap, bitmap.width, bitmap.height);
+        updateCaptures();
+        clearError('submit-error');
+      } finally {
+        bitmap.close();
+      }
     } catch {
-      if (generation === registrationGeneration)
+      if (read === fileReads[index] && generation === registrationGeneration && !sending && currentStep === 3)
         setError('submit-error', localError('readFile'));
+    } finally {
+      if (generation === registrationGeneration) pendingReads[index]--;
+      updateButtons();
     }
   });
 }
 $('back').addEventListener('click', () => showStep(2));
 $('submit').addEventListener('click', async () => {
-  if (sending || captures.some(image => !image)) return;
+  if (sending || cameraStarting || pendingReads.some(count => count) || captures.some(image => !image)) return;
   const studentId = selectedId;
   const studentName = group.students.find(student => student.id === studentId).fullName;
   const images = [...captures];
@@ -459,6 +481,8 @@ $('submit').addEventListener('click', async () => {
       sending = false;
       $('submit').textContent = t('submit');
       updateCaptures();
+      if (currentStep === 3 && !$('camera-mode').hidden && !stream)
+        startCamera($('camera-select').value);
     }
   }
 });
@@ -467,6 +491,7 @@ $('another').addEventListener('click', async () => {
   const generation = ++registrationGeneration;
   selectedId = null;
   captures = [null, null, null];
+  pendingReads.fill(0);
   for (let index = 0; index < 3; index++) $(`file-${index}`).value = '';
   $('consent').checked = false;
   $('student-search').value = '';
