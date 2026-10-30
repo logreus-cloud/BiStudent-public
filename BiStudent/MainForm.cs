@@ -17,6 +17,7 @@ internal sealed class MainForm : DarkForm
     private readonly Dictionary<string, ModernButton> nav = [];
     private readonly ContextMenuStrip userMenu = new() { BackColor = Theme.SurfaceHover, ForeColor = Theme.Text, Font = Theme.Font(10) };
     private readonly Label updateStatus = Ui.Label("", 8.5f, Theme.Accent);
+    private readonly ToolTip updateToolTip = new();
     private readonly Label syncStatus = Ui.Label("", 8.5f, Theme.Muted);
     private readonly ToolTip syncToolTip = new();
     private readonly System.Windows.Forms.Timer syncTimer = new() { Interval = 30000 };
@@ -27,6 +28,7 @@ internal sealed class MainForm : DarkForm
     private Label? userName;
     private Label? userAvatar;
     private string? updateVersion;
+    private UpdateCheckState? updateCheckState;
     private bool switching;
     private bool closingAfterLeave;
     private bool leaving;
@@ -91,8 +93,15 @@ internal sealed class MainForm : DarkForm
         sidebar.Controls.Add(menu, 0, 1);
 
         updateStatus.AutoSize = true; updateStatus.MinimumSize = new Size(0, 28);
-        updateStatus.AutoEllipsis = true; updateStatus.Cursor = Cursors.Hand; updateStatus.Visible = false;
-        updateStatus.Click += (_, _) => InstallUpdate();
+        updateStatus.AutoEllipsis = true; updateStatus.Cursor = Cursors.Hand;
+        updateStatus.Text = "⟳ Проверка обновлений…"; updateStatus.ForeColor = Theme.Muted;
+        updateStatus.Click += async (_, _) =>
+        {
+            if (updateBusy || applyingUpdate || leaving || IsDisposed) return;
+            if (updateCheckState == UpdateCheckState.Available) InstallUpdate();
+            else if (updateCheckState is UpdateCheckState.UpToDate or UpdateCheckState.Failed)
+                await CheckForUpdateAsync(manual: true);
+        };
         sidebar.Controls.Add(updateStatus, 0, 2);
 
         syncStatus.AutoEllipsis = true; syncStatus.Cursor = Cursors.Hand; syncStatus.Visible = false;
@@ -166,21 +175,59 @@ internal sealed class MainForm : DarkForm
         }
     }
 
-    private async Task CheckForUpdateAsync()
+    private async Task CheckForUpdateAsync(bool manual = false)
     {
-        if (updateBusy || updateCancellation.IsCancellationRequested || IsDisposed) return;
+        if (updateBusy || updateCancellation.IsCancellationRequested || IsDisposed || applyingUpdate) return;
         updateBusy = true;
+        updateStatus.Text = "⟳ Проверка обновлений…";
+        updateStatus.ForeColor = Theme.Muted;
+        updateToolTip.SetToolTip(updateStatus, "");
         try
         {
             var cancellationToken = updateCancellation.Token;
-            var version = await Task.Run(() => AppUpdater.CheckAndDownloadAsync(cancellationToken));
-            if (version is null || updateCancellation.IsCancellationRequested || IsDisposed) return;
-            updateVersion = version;
-            updateStatus.Text = $"⬆ Обновление {version} — установить";
-            updateStatus.Visible = true;
-            updateTimer.Stop();
+            var result = await Task.Run(() => AppUpdater.CheckAsync(cancellationToken));
+            if (updateCancellation.IsCancellationRequested || IsDisposed) return;
+            updateCheckState = result.State;
+            updateVersion = result.State == UpdateCheckState.Available ? result.Version : null;
+            switch (result.State)
+            {
+                case UpdateCheckState.NotInstalled:
+                    updateStatus.Text = "Автообновление — только в установленной версии";
+                    updateStatus.ForeColor = Theme.Muted;
+                    updateToolTip.SetToolTip(updateStatus, "Установите программу через BiStudent.Desktop-win-Setup.exe из релиза на GitHub, тогда она будет обновляться сама.");
+                    updateTimer.Stop();
+                    break;
+                case UpdateCheckState.UpToDate:
+                    updateStatus.Text = $"✓ Версия {AppUpdater.CurrentVersion} · проверить обновления";
+                    updateStatus.ForeColor = Theme.Muted;
+                    RestartUpdateTimer(6 * 60 * 60 * 1000);
+                    break;
+                case UpdateCheckState.Available:
+                    updateStatus.Text = $"⬆ Обновление {result.Version} — установить";
+                    updateStatus.ForeColor = Theme.Accent;
+                    updateTimer.Stop();
+                    break;
+                case UpdateCheckState.Failed:
+                    updateStatus.Text = "⚠ Обновления не проверены · повторить";
+                    updateStatus.ForeColor = Theme.Yellow;
+                    updateToolTip.SetToolTip(updateStatus, result.Error);
+                    RestartUpdateTimer(30 * 60 * 1000);
+                    break;
+            }
+            if (manual && result.State == UpdateCheckState.UpToDate)
+                Ui.Toast(this, $"Установлена последняя версия {AppUpdater.CurrentVersion}");
+            else if (manual && result.State == UpdateCheckState.Failed)
+                Ui.Toast(this, result.Error ?? "Не удалось проверить обновления.", true);
         }
         finally { updateBusy = false; }
+    }
+
+    // Присваивание того же Interval не сбрасывает отсчёт — после каждой проверки начинаем его заново.
+    private void RestartUpdateTimer(int interval)
+    {
+        updateTimer.Stop();
+        updateTimer.Interval = interval;
+        updateTimer.Start();
     }
 
     private async Task UpdateSyncAsync(bool run = false)
@@ -344,6 +391,7 @@ internal sealed class MainForm : DarkForm
         updateTimer.Dispose();
         updateCancellation.Dispose();
         syncToolTip.Dispose();
+        updateToolTip.Dispose();
         userMenu.Dispose();
         base.OnFormClosing(e);
     }

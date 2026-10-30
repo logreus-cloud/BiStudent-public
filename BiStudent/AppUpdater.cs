@@ -1,7 +1,14 @@
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
 using Velopack;
 using Velopack.Sources;
 
 namespace BiStudent;
+
+internal enum UpdateCheckState { NotInstalled, UpToDate, Available, Failed }
+
+internal sealed record UpdateCheckResult(UpdateCheckState State, string? Version, string? Error);
 
 internal static class AppUpdater
 {
@@ -34,27 +41,56 @@ internal static class AppUpdater
 
     public static async Task<string?> CheckAndDownloadAsync(CancellationToken cancellationToken)
     {
+        var result = await CheckAsync(cancellationToken).ConfigureAwait(false);
+        return result.State == UpdateCheckState.Available ? result.Version : null;
+    }
+
+    public static async Task<UpdateCheckResult> CheckAsync(CancellationToken cancellationToken)
+    {
         try
         {
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 LastError = null;
-                if (manager.Value is not { IsInstalled: true } updater) return null;
-                if (downloaded is { } existing) return existing.TargetFullRelease.Version.ToString();
+                if (manager.Value is not { IsInstalled: true } updater)
+                    return new(UpdateCheckState.NotInstalled, null, null);
+                if (downloaded is { } existing)
+                    return new(UpdateCheckState.Available, existing.TargetFullRelease.Version.ToString(), null);
                 var info = await updater.CheckForUpdatesAsync().ConfigureAwait(false);
-                if (info is null) return null;
+                if (info is null) return new(UpdateCheckState.UpToDate, null, null);
                 await updater.DownloadUpdatesAsync(info, cancelToken: cancellationToken).ConfigureAwait(false);
                 downloaded = info;
-                return info.TargetFullRelease.Version.ToString();
+                return new(UpdateCheckState.Available, info.TargetFullRelease.Version.ToString(), null);
             }
             finally { gate.Release(); }
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            LastError = ex.ToString();
+            return new(UpdateCheckState.Failed, null, "Проверка обновлений отменена.");
         }
         catch (Exception ex)
         {
             LastError = ex.ToString();
-            return null;
+            return new(UpdateCheckState.Failed, null, Describe(ex));
         }
+    }
+
+    internal static string Describe(Exception ex)
+    {
+        List<Exception> errors = [];
+        for (Exception? current = ex; current is not null; current = current.InnerException)
+            errors.Add(current);
+
+        if (errors.Any(error => error is HttpRequestException { StatusCode: HttpStatusCode.Forbidden or HttpStatusCode.TooManyRequests }
+            || error.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase)))
+            return "GitHub временно ограничил запросы с этой сети (лимит 60 в час). Повторите позже.";
+        if (errors.Any(error => error is HttpRequestException { StatusCode: null } or SocketException or TaskCanceledException or TimeoutException))
+            return "Нет связи с GitHub — проверьте интернет или ограничения сети колледжа.";
+        if (errors.FirstOrDefault(error => error is IOException or UnauthorizedAccessException) is { } storageError)
+            return $"Не удалось сохранить обновление: {storageError.Message}";
+        return $"Не удалось проверить обновления: {ex.Message}";
     }
 
     public static void ApplyAndRestart()
